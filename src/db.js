@@ -15,6 +15,7 @@ export function openDb(env) {
     id TEXT PRIMARY KEY, org TEXT, atlas TEXT, item TEXT, what TEXT,
     who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
     cleared_date TEXT, cleared_words TEXT)`);
+  db.exec('CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, scope TEXT, url TEXT, date TEXT, last_delivery_date TEXT, last_delivery_status INTEGER)');
   migrate(db);
   return db;
 }

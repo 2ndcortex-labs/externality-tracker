@@ -1,12 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { toWire } from './db.js';
+import { HttpError, parseScope } from './auth.js';
 
-export class HttpError extends Error {
-  constructor(status, reason) {
-    super(reason);
-    this.status = status;
-  }
-}
+export { HttpError };
 
 const TEXT = { 'what': 'what', 'who-acts': 'who_acts', 'how-observed': 'how_observed' };
 const STATES = ['open', 'cleared'];
@@ -20,9 +16,10 @@ function needSlugs(call) {
   if (!call.item) throw new HttpError(400, 'item-slug is required');
 }
 
+// call.scope: null or absent for `all`, else the atlas slugs the token may see.
 function findOwn(db, id, call) {
   const row = db.prepare('SELECT * FROM externalities WHERE id = ? AND org = ?').get(id, call.org);
-  if (!row || row.atlas !== call.atlas || row.item !== call.item) {
+  if (!row || row.atlas !== call.atlas || row.item !== call.item || (call.scope && !call.scope.includes(row.atlas))) {
     throw new HttpError(404, 'unknown id');
   }
   return row;
@@ -30,6 +27,33 @@ function findOwn(db, id, call) {
 
 function isObject(body) {
   return body !== null && typeof body === 'object' && !Array.isArray(body);
+}
+
+function isHttpUrl(v) {
+  if (typeof v !== 'string') return false;
+  try {
+    const { protocol } = new URL(v);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+export function mint(db, call, body) {
+  if (!isObject(body)) throw new HttpError(400, 'body must be a JSON object');
+  const scope = parseScope(body.scope);
+  if (scope === null) throw new HttpError(400, 'scope must be all or a comma-delineated list of atlas slugs');
+  const url = body.url ?? null;
+  if (url !== null && !isHttpUrl(url)) throw new HttpError(400, 'url must be an absolute http or https URL');
+  const row = {
+    token: randomBytes(32).toString('base64url'),
+    scope: scope === 'all' ? 'all' : scope.join(','),
+    url,
+    date: new Date().toISOString(),
+  };
+  db.prepare(`INSERT INTO tokens (token, scope, url, date, last_delivery_date, last_delivery_status)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(row.token, row.scope, row.url, row.date, null, null);
+  return [201, row];
 }
 
 export function add(db, call, body) {
@@ -101,11 +125,22 @@ export function inventory(db, call, url) {
   const args = [call.org];
   if (call.atlas) { where.push('atlas = ?'); args.push(call.atlas); }
   if (call.item) { where.push('item = ?'); args.push(call.item); }
+  if (call.scope) {
+    where.push(`atlas IN (${call.scope.map(() => '?').join(', ')})`);
+    args.push(...call.scope);
+  }
   const state = url.searchParams.get('state');
   if (state !== null) {
     if (!STATES.includes(state)) throw new HttpError(400, 'state must be open or cleared');
     where.push('state = ?');
     args.push(state);
+  }
+  const q = url.searchParams.get('q');
+  if (q !== null) {
+    if (q === '') throw new HttpError(400, 'q must be a non-empty string');
+    const pattern = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    where.push(`(what LIKE ? ESCAPE '\\' OR who_acts LIKE ? ESCAPE '\\' OR how_observed LIKE ? ESCAPE '\\')`);
+    args.push(pattern, pattern, pattern);
   }
   const rows = db.prepare(`SELECT * FROM externalities WHERE ${where.join(' AND ')}
     ORDER BY set_date DESC, id ASC`).all(...args);
