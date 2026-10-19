@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 
 const VALUES = [
   ['org', 'x-org-slug', 'org-slug'],
-  ['nav', 'x-nav-slug', 'nav-slug'],
+  ['atlas', 'x-atlas-slug', 'atlas-slug'],
   ['item', 'x-item-slug', 'item-slug'],
   ['key', 'x-externality-key', 'externality-key'],
 ];
