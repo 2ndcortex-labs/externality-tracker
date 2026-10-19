@@ -6,7 +6,9 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import http from 'node:http';
 import { createServer } from '../src/server.js';
+import { timeoutMs } from '../src/deliver.js';
 
 const ORG = 'test-org';
 const KEY = 'test-key-0123456789';
@@ -14,6 +16,8 @@ const FIELDS = ['id', 'org-slug', 'atlas-slug', 'item-slug', 'what', 'who-acts',
   'state', 'set-date', 'cleared-date', 'cleared-words'];
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const DELIVERY_TIMEOUT = 400; // the test server's DELIVERY_TIMEOUT_MS
+const NEGATIVE_WAIT = DELIVERY_TIMEOUT + 300; // a wait for nothing to arrive: the timeout and a margin
 
 let server;
 let base;
@@ -22,7 +26,7 @@ let TOKEN; // a token of scope `all`, never printed
 
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'externality-tracker-'));
-  server = createServer({ ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, DATA_DIR: dataDir });
+  server = createServer({ ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, DATA_DIR: dataDir, DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT) });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${server.address().port}`;
   TOKEN = (await mintToken('all')).token;
@@ -320,11 +324,11 @@ test('tokens: a mint answers 201 with the token, the normalised scope, the url a
   for (const scope of [' all ', 'all,all']) assert.equal((await mintToken(scope)).scope, 'all', scope);
   assert.equal((await mintToken('All')).scope, 'All');
   assert.equal((await mintToken('a', null)).url, null);
-  const hook = 'https://example.com/hook?x=1&y=two';
+  const hook = 'http://127.0.0.1:1/hook?x=1&y=two';
   const withUrl = await mintToken(' b, a ,a', hook);
   assert.equal(withUrl.scope, 'b,a');
   assert.equal(withUrl.url, hook);
-  assert.equal((await mintToken('none', 'http://localhost:8080/in')).url, 'http://localhost:8080/in');
+  assert.equal((await mintToken('none', 'http://127.0.0.1:1/in')).url, 'http://127.0.0.1:1/in');
 
   const db = new DatabaseSync(join(dataDir, 'externalities.sqlite'));
   try {
@@ -606,4 +610,250 @@ test('the old header alone is refused', async () => {
   const p = await call('POST', '/add', { headers: auth(null, 'i'), params: { 'nav-slug': 'n' }, body: BODY });
   assert.equal(p.status, 400);
   assert.equal(p.json.error, 'atlas-slug is required');
+});
+
+// Delivery: every add re-sent once to the URL of each in-scope token. The one test server delivers every add to
+// every in-scope token with a URL, so each test mints its own token with its own receiver under its own atlas,
+// and counts only the requests carrying its own record's id. No assertion message below carries a token.
+
+const receivers = [];
+
+after(async () => {
+  for (const r of receivers) {
+    r.server.closeAllConnections();
+    await new Promise((resolve) => r.server.close(resolve));
+  }
+});
+
+const idOfBody = (body) => {
+  try {
+    return JSON.parse(body).id;
+  } catch {
+    return null;
+  }
+};
+
+// A local receiver on port 0: records each request's headers and body, and the connections that carried a
+// request (the platform's fetch may open an empty one after an abort, which carries none); answers `status`,
+// or never answers (the socket held open) when `status` is null. `status` may be changed between adds.
+async function receiver(status = 200) {
+  const r = { requests: [], sockets: new Set(), status };
+  r.server = http.createServer((req, res) => {
+    r.sockets.add(req.socket);
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      r.requests.push({ headers: req.headers, body: Buffer.concat(chunks).toString('utf8') });
+      if (r.status !== null) {
+        res.writeHead(r.status);
+        res.end();
+      }
+    });
+  });
+  await new Promise((resolve) => r.server.listen(0, '127.0.0.1', resolve));
+  r.url = `http://127.0.0.1:${r.server.address().port}/hook`;
+  r.withId = (id) => r.requests.filter((q) => idOfBody(q.body) === id);
+  receivers.push(r);
+  return r;
+}
+
+// A URL on a port nothing listens on: a server listened, then closed.
+async function closedPortUrl() {
+  const s = http.createServer();
+  await new Promise((resolve) => s.listen(0, '127.0.0.1', resolve));
+  const { port } = s.address();
+  await new Promise((resolve) => s.close(resolve));
+  return `http://127.0.0.1:${port}/hook`;
+}
+
+async function tokenRecord(token) {
+  const r = await call('GET', '/token', { headers: byToken(token) });
+  assert.equal(r.status, 200, r.json && r.json.error);
+  return r.json;
+}
+
+// Polls GET /token every 50 ms, up to 3 s, until `done` holds: by default, until a delivery has settled.
+async function settled(token, done = (t) => t['last-delivery-date'] !== null) {
+  for (let i = 0; i < 60; i++) {
+    const t = await tokenRecord(token);
+    if (done(t)) return t;
+    await sleep(50);
+  }
+  return assert.fail('no delivery settled within 3 s');
+}
+
+async function addFull(atlas, item) {
+  const r = await call('POST', '/add', { headers: auth(atlas, item), body: BODY });
+  assert.equal(r.status, 201, JSON.stringify(r.json));
+  return r.json;
+}
+
+const assertAddShape = (r) => {
+  assert.equal(r.status, 201, JSON.stringify(r.json));
+  assert.deepEqual(Object.keys(r.json).sort(), ['id', 'record']);
+  assert.equal(r.json.record.id, r.json.id);
+  assert.deepEqual(Object.keys(r.json.record).sort(), [...FIELDS].sort());
+  assert.equal(r.json.record.state, 'open');
+};
+
+const TOKEN_FIELDS = ['date', 'last-delivery-date', 'last-delivery-status', 'scope', 'url'];
+
+test('delivery: a scoped token with a URL receives the add once, JSON, no auth header, the inventory record', async () => {
+  const rx = await receiver();
+  const atlas = 'dlv-scoped';
+  const item = 'dlv-scoped-item';
+  const t = await mintToken(atlas, rx.url);
+  const added = await addFull(atlas, item);
+  const outcome = await settled(t.token);
+  const got = rx.withId(added.id);
+  assert.equal(got.length, 1, 'exactly one request with the id');
+  assert.ok(String(got[0].headers['content-type']).startsWith('application/json'), got[0].headers['content-type']);
+  assert.equal('authorization' in got[0].headers, false, 'no auth header');
+  const body = JSON.parse(got[0].body);
+  assert.deepEqual(body, added.record, 'the add response record');
+  const inv = await call('GET', '/inventory', { headers: read(atlas, item) });
+  assert.equal(inv.status, 200);
+  const fromInventory = inv.json.records.find((rec) => rec.id === added.id);
+  assert.ok(fromInventory, 'inventory lists the record');
+  assert.deepEqual(body, fromInventory, 'the inventory record');
+  assert.equal(outcome['last-delivery-status'], 200);
+  assert.match(outcome['last-delivery-date'], ISO);
+});
+
+test('delivery: an add under another atlas does not reach the scoped token', async () => {
+  const rx = await receiver();
+  const t = await mintToken('dlv-mine', rx.url);
+  const added = await addFull('dlv-not-mine', 'dlv-not-mine-item');
+  await sleep(NEGATIVE_WAIT);
+  assert.equal(rx.withId(added.id).length, 0);
+  assert.equal(rx.requests.length, 0, 'the receiver was not called');
+  const rec = await tokenRecord(t.token);
+  assert.equal(rec['last-delivery-date'], null);
+  assert.equal(rec['last-delivery-status'], null);
+});
+
+test('delivery: a token of scope all with a URL receives the add', async () => {
+  const rx = await receiver();
+  const t = await mintToken('all', rx.url);
+  const added = await addFull('dlv-all-atlas', 'dlv-all-item');
+  const outcome = await settled(t.token);
+  assert.equal(rx.withId(added.id).length, 1);
+  assert.deepEqual(JSON.parse(rx.withId(added.id)[0].body), added.record);
+  assert.equal(outcome['last-delivery-status'], 200);
+  assert.match(outcome['last-delivery-date'], ISO);
+});
+
+test('delivery: a token without a URL stays at nulls', async () => {
+  const atlas = 'dlv-no-url';
+  const t = await mintToken(atlas);
+  assert.equal(t.url, null);
+  await addFull(atlas, 'dlv-no-url-item');
+  await sleep(NEGATIVE_WAIT);
+  const rec = await tokenRecord(t.token);
+  assert.equal(rec.url, null);
+  assert.equal(rec['last-delivery-date'], null);
+  assert.equal(rec['last-delivery-status'], null);
+});
+
+test('delivery: a receiver answering 500 stores 500 and is called once', async () => {
+  const rx = await receiver(500);
+  const atlas = 'dlv-500';
+  const t = await mintToken(atlas, rx.url);
+  const added = await addFull(atlas, 'dlv-500-item');
+  const outcome = await settled(t.token);
+  assert.equal(outcome['last-delivery-status'], 500);
+  assert.match(outcome['last-delivery-date'], ISO);
+  assert.equal(rx.withId(added.id).length, 1);
+  await sleep(NEGATIVE_WAIT);
+  assert.equal(rx.withId(added.id).length, 1, 'no retry');
+  assert.equal(rx.requests.length, 1);
+});
+
+test('delivery: a never-answering receiver stores 0, connected once, the add answering 201 first', async () => {
+  const rx = await receiver(null);
+  const atlas = 'dlv-silent';
+  const t = await mintToken(atlas, rx.url);
+  const started = performance.now();
+  const r = await call('POST', '/add', { headers: auth(atlas, 'dlv-silent-item'), body: BODY });
+  const elapsed = performance.now() - started;
+  assertAddShape(r);
+  assert.ok(elapsed < DELIVERY_TIMEOUT, `the add answered in ${Math.round(elapsed)} ms, before the timeout`);
+  const outcome = await settled(t.token);
+  assert.equal(outcome['last-delivery-status'], 0);
+  assert.match(outcome['last-delivery-date'], ISO);
+  assert.equal(rx.withId(r.json.id).length, 1, 'one request');
+  assert.equal(rx.sockets.size, 1, 'connected once');
+});
+
+test('delivery: a closed port stores 0 and the add answers 201 in shape', async () => {
+  const atlas = 'dlv-closed';
+  const t = await mintToken(atlas, await closedPortUrl());
+  const r = await call('POST', '/add', { headers: auth(atlas, 'dlv-closed-item'), body: BODY });
+  assertAddShape(r);
+  const outcome = await settled(t.token);
+  assert.equal(outcome['last-delivery-status'], 0);
+  assert.match(outcome['last-delivery-date'], ISO);
+});
+
+test('delivery: an update is not re-sent', async () => {
+  const rx = await receiver();
+  const atlas = 'dlv-update';
+  const item = 'dlv-update-item';
+  const t = await mintToken(atlas, rx.url);
+  const added = await addFull(atlas, item);
+  await settled(t.token);
+  assert.equal(rx.withId(added.id).length, 1);
+  const u = await call('POST', '/update', { headers: byToken(t.token, atlas, item), body: { id: added.id, what: 'changed after the delivery' } });
+  assert.equal(u.status, 200, u.json && u.json.error);
+  assert.equal(u.json.record.what, 'changed after the delivery');
+  await sleep(NEGATIVE_WAIT);
+  assert.equal(rx.withId(added.id).length, 1, 'the update was not re-sent');
+  assert.equal(rx.requests.length, 1);
+});
+
+test('delivery: a second add overwrites the outcome', async () => {
+  const rx = await receiver(200);
+  const atlas = 'dlv-overwrite';
+  const t = await mintToken(atlas, rx.url);
+  const first = await addFull(atlas, 'dlv-overwrite-item');
+  const one = await settled(t.token);
+  assert.equal(one['last-delivery-status'], 200);
+  rx.status = 500;
+  const second = await addFull(atlas, 'dlv-overwrite-item');
+  const two = await settled(t.token, (x) => x['last-delivery-status'] === 500);
+  assert.equal(two['last-delivery-status'], 500);
+  assert.match(two['last-delivery-date'], ISO);
+  assert.ok(two['last-delivery-date'] >= one['last-delivery-date'], 'the later attempt dated no earlier');
+  assert.equal(rx.withId(first.id).length, 1);
+  assert.equal(rx.withId(second.id).length, 1);
+});
+
+test('GET /token: the token record without the token value, nulls before any delivery', async () => {
+  const rx = await receiver();
+  const t = await mintToken('dlv-token-info', rx.url);
+  const r = await call('GET', '/token', { headers: byToken(t.token) });
+  assert.equal(r.status, 200, r.json && r.json.error);
+  assert.deepEqual(Object.keys(r.json).sort(), TOKEN_FIELDS);
+  assert.equal('token' in r.json, false, 'no token field');
+  assert.equal(r.json.scope, t.scope);
+  assert.equal(r.json.url, t.url);
+  assert.equal(r.json.url, rx.url);
+  assert.equal(r.json.date, t.date);
+  assert.equal(r.json['last-delivery-date'], null);
+  assert.equal(r.json['last-delivery-status'], null);
+  assert.equal(rx.requests.length, 0);
+});
+
+test('GET /token: the org key alone is refused with 401', async () => {
+  const r = await call('GET', '/token', { headers: auth() });
+  assert.equal(r.status, 401);
+  assert.equal(r.json.error, 'consumer token is required');
+});
+
+test('timeoutMs: 10000 by default, the variable when a positive integer, else 10000', () => {
+  assert.equal(timeoutMs({}), 10000);
+  assert.equal(timeoutMs({ DELIVERY_TIMEOUT_MS: '500' }), 500);
+  assert.equal(timeoutMs({ DELIVERY_TIMEOUT_MS: 'abc' }), 10000);
+  assert.equal(timeoutMs({ DELIVERY_TIMEOUT_MS: '0' }), 10000);
+  assert.equal(timeoutMs({ DELIVERY_TIMEOUT_MS: '-5' }), 10000);
 });
