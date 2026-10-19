@@ -69,7 +69,7 @@ export function authenticateToken(call, db, config) {
   if (!call.token) throw new HttpError(401, 'consumer token is required');
   if (call.org !== null && call.org !== config.org) throw new HttpError(401, 'org slug does not match');
   let found = null;
-  for (const row of db.prepare('SELECT token, scope FROM tokens').all()) {
+  for (const row of db.prepare('SELECT * FROM tokens').all()) {
     if (safeEqual(call.token, row.token) && !found) found = row;
   }
   if (!found) throw new HttpError(401, 'unknown consumer token');

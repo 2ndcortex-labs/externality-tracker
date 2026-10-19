@@ -3,7 +3,8 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { loadAuthConfig, resolveCall, refuse, authenticateToken, parseScope } from './auth.js';
 import { openDb } from './db.js';
-import { HttpError, add, mint, update, status, inventory } from './routes.js';
+import { HttpError, add, mint, update, status, inventory, tokenInfo } from './routes.js';
+import { deliver } from './deliver.js';
 
 const STARTED = new Date(performance.timeOrigin).toISOString();
 const MAX_BODY = 1024 * 1024;
@@ -15,6 +16,7 @@ const ROUTES = {
   'POST /update': { credential: 'token', handler: (db, call, url, body) => update(db, call, body) },
   'GET /status': { credential: 'token', handler: (db, call, url) => status(db, call, url) },
   'GET /inventory': { credential: 'token', handler: (db, call, url) => inventory(db, call, url) },
+  'GET /token': { credential: 'token', handler: (db, call) => tokenInfo(call) },
 };
 
 function send(res, code, payload) {
@@ -47,20 +49,25 @@ export function createServer(env = process.env) {
       if (req.method === 'GET' && url.pathname === '/') {
         return send(res, 200, { ok: true, service: 'externality-tracker', node: process.version, started: STARTED });
       }
-      const route = ROUTES[`${req.method} ${url.pathname}`];
+      const name = `${req.method} ${url.pathname}`;
+      const route = ROUTES[name];
       if (!route) return send(res, 404, { error: 'not found' });
       const call = resolveCall(req, url);
       if (route.credential === 'key') {
         const reason = refuse(call, config);
         if (reason) return send(res, 401, { error: reason });
       } else {
-        const scope = parseScope(authenticateToken(call, db, config).scope);
+        call.tokenRow = authenticateToken(call, db, config);
+        const scope = parseScope(call.tokenRow.scope);
         call.scope = scope === 'all' ? null : scope ?? [];
         call.org = config.org;
       }
       const body = req.method === 'POST' ? await readJson(req) : undefined;
       const [code, payload] = route.handler(db, call, url, body);
-      return send(res, code, payload);
+      send(res, code, payload);
+      // The add has answered; its deliveries start now and are never awaited.
+      if (name === 'POST /add' && code === 201) void deliver(db, payload.record, env);
+      return;
     } catch (err) {
       if (err instanceof HttpError) return send(res, err.status, { error: err.message });
       console.error(err);

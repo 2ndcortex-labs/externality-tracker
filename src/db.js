@@ -44,3 +44,14 @@ export function toWire(row) {
     'cleared-words': row.cleared_words || null,
   };
 }
+
+// A token's own record on the wire: the five fields written out, the token value never among them.
+export function toTokenWire(row) {
+  return {
+    'scope': row.scope,
+    'url': row.url ?? null,
+    'date': row.date,
+    'last-delivery-date': row.last_delivery_date ?? null,
+    'last-delivery-status': row.last_delivery_status ?? null,
+  };
+}

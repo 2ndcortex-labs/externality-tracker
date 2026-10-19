@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { toWire } from './db.js';
+import { toWire, toTokenWire } from './db.js';
 import { HttpError, parseScope } from './auth.js';
 
 export { HttpError };
@@ -145,4 +145,9 @@ export function inventory(db, call, url) {
   const rows = db.prepare(`SELECT * FROM externalities WHERE ${where.join(' AND ')}
     ORDER BY set_date DESC, id ASC`).all(...args);
   return [200, { records: rows.map(toWire) }];
+}
+
+// The calling token's own record, read by its own credential.
+export function tokenInfo(call) {
+  return [200, toTokenWire(call.tokenRow)];
 }
