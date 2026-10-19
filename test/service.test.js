@@ -324,11 +324,11 @@ test('tokens: a mint answers 201 with the token, the normalised scope, the url a
   for (const scope of [' all ', 'all,all']) assert.equal((await mintToken(scope)).scope, 'all', scope);
   assert.equal((await mintToken('All')).scope, 'All');
   assert.equal((await mintToken('a', null)).url, null);
-  const hook = 'https://example.com/hook?x=1&y=two';
+  const hook = 'http://127.0.0.1:1/hook?x=1&y=two';
   const withUrl = await mintToken(' b, a ,a', hook);
   assert.equal(withUrl.scope, 'b,a');
   assert.equal(withUrl.url, hook);
-  assert.equal((await mintToken('none', 'http://localhost:8080/in')).url, 'http://localhost:8080/in');
+  assert.equal((await mintToken('none', 'http://127.0.0.1:1/in')).url, 'http://127.0.0.1:1/in');
 
   const db = new DatabaseSync(join(dataDir, 'externalities.sqlite'));
   try {
