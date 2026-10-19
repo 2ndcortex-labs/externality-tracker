@@ -12,17 +12,27 @@ export function openDb(env) {
   const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
   db.exec('PRAGMA journal_mode = WAL');
   db.exec(`CREATE TABLE IF NOT EXISTS externalities (
-    id TEXT PRIMARY KEY, org TEXT, nav TEXT, item TEXT, what TEXT,
+    id TEXT PRIMARY KEY, org TEXT, atlas TEXT, item TEXT, what TEXT,
     who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
     cleared_date TEXT, cleared_words TEXT)`);
+  migrate(db);
   return db;
+}
+
+// A database made before 2026-10-19 keys its records by the old column: renamed in place to `atlas`,
+// values kept; a second start finds `atlas` and does nothing.
+function migrate(db) {
+  const columns = db.prepare('PRAGMA table_info(externalities)').all().map((c) => c.name);
+  if (columns.includes('nav') && !columns.includes('atlas')) {
+    db.exec('ALTER TABLE externalities RENAME COLUMN nav TO atlas');
+  }
 }
 
 export function toWire(row) {
   return {
     'id': row.id,
     'org-slug': row.org,
-    'nav-slug': row.nav,
+    'atlas-slug': row.atlas,
     'item-slug': row.item,
     'what': row.what,
     'who-acts': row.who_acts,

@@ -29,7 +29,7 @@ Every call carries four values, each by header or by URL parameter. Where both a
 | Value | Header | URL parameter |
 |---|---|---|
 | org slug | `X-Org-Slug` | `org-slug` |
-| navigation slug | `X-Nav-Slug` | `nav-slug` |
+| atlas slug (free text; `none` for an item under no atlas) | `X-Atlas-Slug` | `atlas-slug` |
 | item slug | `X-Item-Slug` | `item-slug` |
 | key | `X-Externality-Key` | `externality-key` |
 
@@ -39,10 +39,10 @@ A missing or wrong key, or an org slug other than `ORG_SLUG`, is refused with 40
 
 JSON in and out. Errors are `{"error": "<reason>"}`: 400 for a bad body or a missing field, 401 for a refused key or org, 404 for an unknown id, route or method.
 
-- `POST /add` — body `{"what", "who-acts", "how-observed"}`, all non-empty strings; nav and item slugs required. Returns 201 `{"id", "record"}`, state `open`.
-- `POST /update` — body `{"id"}` plus at least one of `what`, `who-acts`, `how-observed`, `state` (`open` | `cleared`), `cleared-words`. Clearing requires `cleared-words` and sets `cleared-date`; reopening empties both. The record must match the call's nav and item slugs. Returns 200 `{"record"}`.
-- `GET /status?id=<id>` — nav and item slugs required and matching. Returns 200 `{"record"}`.
-- `GET /inventory` — nav and item slugs optional (none, either or both narrow the list); optional `state=open|cleared`. Returns 200 `{"records": [...]}`, newest `set-date` first, ties by id.
+- `POST /add` — body `{"what", "who-acts", "how-observed"}`, all non-empty strings; atlas and item slugs required. Returns 201 `{"id", "record"}`, state `open`.
+- `POST /update` — body `{"id"}` plus at least one of `what`, `who-acts`, `how-observed`, `state` (`open` | `cleared`), `cleared-words`. Clearing requires `cleared-words` and sets `cleared-date`; reopening empties both. The record must match the call's atlas and item slugs. Returns 200 `{"record"}`.
+- `GET /status?id=<id>` — atlas and item slugs required and matching. Returns 200 `{"record"}`.
+- `GET /inventory` — atlas and item slugs optional (none, either or both narrow the list); optional `state=open|cleared`. Returns 200 `{"records": [...]}`, newest `set-date` first, ties by id.
 - `GET /` — no key; `{"ok": true, "service": "externality-tracker", "node", "started"}`.
 
-A record has exactly these fields: `id`, `org-slug`, `nav-slug`, `item-slug`, `what`, `who-acts`, `how-observed`, `state`, `set-date`, `cleared-date`, `cleared-words`. Dates are ISO 8601 UTC; the last two are `null` while the record is open.
+A record has exactly these fields: `id`, `org-slug`, `atlas-slug`, `item-slug`, `what`, `who-acts`, `how-observed`, `state`, `set-date`, `cleared-date`, `cleared-words`. Dates are ISO 8601 UTC; the last two are `null` while the record is open.

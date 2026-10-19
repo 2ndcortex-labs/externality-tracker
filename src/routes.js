@@ -16,13 +16,13 @@ function isText(v) {
 }
 
 function needSlugs(call) {
-  if (!call.nav) throw new HttpError(400, 'nav-slug is required');
+  if (!call.atlas) throw new HttpError(400, 'atlas-slug is required');
   if (!call.item) throw new HttpError(400, 'item-slug is required');
 }
 
 function findOwn(db, id, call) {
   const row = db.prepare('SELECT * FROM externalities WHERE id = ? AND org = ?').get(id, call.org);
-  if (!row || row.nav !== call.nav || row.item !== call.item) {
+  if (!row || row.atlas !== call.atlas || row.item !== call.item) {
     throw new HttpError(404, 'unknown id');
   }
   return row;
@@ -39,14 +39,14 @@ export function add(db, call, body) {
     if (!isText(body[field])) throw new HttpError(400, `${field} must be a non-empty string`);
   }
   const row = {
-    id: randomUUID(), org: call.org, nav: call.nav, item: call.item,
+    id: randomUUID(), org: call.org, atlas: call.atlas, item: call.item,
     what: body['what'], who_acts: body['who-acts'], how_observed: body['how-observed'],
     state: 'open', set_date: new Date().toISOString(), cleared_date: null, cleared_words: null,
   };
   db.prepare(`INSERT INTO externalities
-    (id, org, nav, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words)
+    (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    row.id, row.org, row.nav, row.item, row.what, row.who_acts, row.how_observed,
+    row.id, row.org, row.atlas, row.item, row.what, row.who_acts, row.how_observed,
     row.state, row.set_date, row.cleared_date, row.cleared_words);
   return [201, { id: row.id, record: toWire(row) }];
 }
@@ -99,7 +99,7 @@ export function status(db, call, url) {
 export function inventory(db, call, url) {
   const where = ['org = ?'];
   const args = [call.org];
-  if (call.nav) { where.push('nav = ?'); args.push(call.nav); }
+  if (call.atlas) { where.push('atlas = ?'); args.push(call.atlas); }
   if (call.item) { where.push('item = ?'); args.push(call.item); }
   const state = url.searchParams.get('state');
   if (state !== null) {
