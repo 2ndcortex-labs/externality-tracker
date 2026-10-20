@@ -11,8 +11,6 @@ const VALUES = [
   ['org', 'x-org-slug', 'org-slug'],
   ['atlas', 'x-atlas-slug', 'atlas-slug'],
   ['item', 'x-item-slug', 'item-slug'],
-  ['key', 'x-externality-key', 'externality-key'],
-  ['token', 'x-consumer-token', 'consumer-token'],
 ];
 
 export function loadAuthConfig(env) {
@@ -23,9 +21,19 @@ export function loadAuthConfig(env) {
   return { org, key };
 }
 
-// Header first, then URL parameter.
+// The org key from `Authorization: Bearer <key>`: the scheme in any case, then spaces only, the key trimmed.
+function bearer(req) {
+  const h = req.headers.authorization;
+  const m = typeof h === 'string' ? /^bearer +(\S.*)$/i.exec(h) : null;
+  return m ? m[1].trim() : null;
+}
+
+// The two credentials from their headers only; the slugs header first, then URL parameter.
 export function resolveCall(req, url) {
   const call = {};
+  call.key = bearer(req);
+  const t = req.headers['x-consumer-token'];
+  call.token = typeof t === 'string' && t !== '' ? t : null;
   for (const [name, header, param] of VALUES) {
     const h = req.headers[header];
     const v = typeof h === 'string' && h !== '' ? h : url.searchParams.get(param);
