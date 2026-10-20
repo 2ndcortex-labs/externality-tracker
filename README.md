@@ -31,10 +31,10 @@ Every call carries four values, each by header or by URL parameter. Where both a
 | org slug | `X-Org-Slug` | `org-slug` |
 | atlas slug (free text; `none` for an item under no atlas) | `X-Atlas-Slug` | `atlas-slug` |
 | item slug | `X-Item-Slug` | `item-slug` |
-| key | `X-Externality-Key` | `externality-key` |
-| consumer token | `X-Consumer-Token` | `consumer-token` |
+| key | `Authorization: Bearer <key>` | — |
+| consumer token | `X-Consumer-Token` | — |
 
-Each route reads one credential and ignores the other: `POST /add` and `POST /tokens` read the org key (`X-Externality-Key`), while `GET /status`, `POST /update` and `GET /inventory` read a consumer token (`X-Consumer-Token`, 401 `consumer token is required` without one), on which the org slug is optional but must match `ORG_SLUG` when sent.
+Each route reads one credential and ignores the other: `POST /add` and `POST /tokens` read the org key (`Authorization: Bearer <key>`, the scheme in any case), while `GET /status`, `POST /update` and `GET /inventory` read a consumer token (`X-Consumer-Token`, 401 `consumer token is required` without one), on which the org slug is optional but must match `ORG_SLUG` when sent. No credential is read from a URL parameter.
 
 A missing or wrong key, or an org slug other than `ORG_SLUG`, is refused with 401 and `{"error": "<reason>"}`.
 
