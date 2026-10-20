@@ -2,7 +2,7 @@
 
 A small service that records and tracks externalities: things that must happen out of band before a road plans item can complete. Node 24, zero dependencies, `node:http` and `node:sqlite`.
 
-road plans: nethub/roadwork of the BAA Workspace (temporary authority)
+road plans: nethub/nexus/roadwork of the BAA Workspace (temporary authority)
 
 ## Run
 
@@ -24,7 +24,7 @@ The database is `${DATA_DIR}/externalities.sqlite`. `DATA_DIR` is read from the 
 
 ## Call values
 
-Every call carries four values, each by header or by URL parameter. Where both are set, the header wins.
+Every call carries five values. The three slugs travel by header or by URL parameter; where both are set, the header wins. The two credentials travel by header only; no credential is read from a URL parameter.
 
 | Value | Header | URL parameter |
 |---|---|---|
@@ -34,7 +34,7 @@ Every call carries four values, each by header or by URL parameter. Where both a
 | key | `Authorization: Bearer <key>` | — |
 | consumer token | `X-Consumer-Token` | — |
 
-Each route reads one credential and ignores the other: `POST /add` and `POST /tokens` read the org key (`Authorization: Bearer <key>`, the scheme in any case), while `GET /status`, `POST /update` and `GET /inventory` read a consumer token (`X-Consumer-Token`, 401 `consumer token is required` without one), on which the org slug is optional but must match `ORG_SLUG` when sent. No credential is read from a URL parameter.
+Each route reads one credential and ignores the other: `POST /add` and `POST /tokens` read the org key (`Authorization: Bearer <key>`, the scheme in any case), while `GET /status`, `POST /update`, `GET /inventory` and `GET /token` read a consumer token (`X-Consumer-Token`, 401 `consumer token is required` without one), on which the org slug is optional but must match `ORG_SLUG` when sent.
 
 A missing or wrong key, or an org slug other than `ORG_SLUG`, is refused with 401 and `{"error": "<reason>"}`.
 
