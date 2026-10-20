@@ -52,7 +52,7 @@ async function call(method, path, { headers = {}, params = {}, body, raw } = {})
 }
 
 const auth = (atlas, item, extra = {}) => ({
-  'X-Org-Slug': ORG, 'X-Externality-Key': KEY,
+  'X-Org-Slug': ORG, 'Authorization': `Bearer ${KEY}`,
   ...(atlas ? { 'X-Atlas-Slug': atlas } : {}), ...(item ? { 'X-Item-Slug': item } : {}), ...extra,
 });
 
@@ -225,21 +225,39 @@ test('inventory by none, atlas, item, both and state, newest first', async () =>
 });
 
 test('precedence: org-slug from header, param, header wins', async () => {
-  const p = { 'consumer-token': TOKEN };
-  assert.equal((await call('GET', '/inventory', { headers: { 'X-Org-Slug': ORG }, params: p })).status, 200);
-  assert.equal((await call('GET', '/inventory', { params: { ...p, 'org-slug': ORG } })).status, 200);
-  assert.equal((await call('GET', '/inventory', { headers: { 'X-Org-Slug': ORG }, params: { ...p, 'org-slug': 'wrong' } })).status, 200);
-  assert.equal((await call('GET', '/inventory', { headers: { 'X-Org-Slug': 'wrong' }, params: { ...p, 'org-slug': ORG } })).status, 401);
+  const h = read();
+  assert.equal((await call('GET', '/inventory', { headers: { ...h, 'X-Org-Slug': ORG } })).status, 200);
+  assert.equal((await call('GET', '/inventory', { headers: h, params: { 'org-slug': ORG } })).status, 200);
+  assert.equal((await call('GET', '/inventory', { headers: { ...h, 'X-Org-Slug': ORG }, params: { 'org-slug': 'wrong' } })).status, 200);
+  assert.equal((await call('GET', '/inventory', { headers: { ...h, 'X-Org-Slug': 'wrong' }, params: { 'org-slug': ORG } })).status, 401);
 });
 
-// The key is read by add and /tokens only, so its precedence is proved on add.
-test('precedence: externality-key from header, param, header wins', async () => {
-  const p = { 'org-slug': ORG };
-  const s = { 'X-Atlas-Slug': 'prec-key', 'X-Item-Slug': 'prec-key' };
-  assert.equal((await call('POST', '/add', { headers: { ...s, 'X-Externality-Key': KEY }, params: p, body: BODY })).status, 201);
-  assert.equal((await call('POST', '/add', { headers: s, params: { ...p, 'externality-key': KEY }, body: BODY })).status, 201);
-  assert.equal((await call('POST', '/add', { headers: { ...s, 'X-Externality-Key': KEY }, params: { ...p, 'externality-key': 'wrong' }, body: BODY })).status, 201);
-  assert.equal((await call('POST', '/add', { headers: { ...s, 'X-Externality-Key': 'wrong' }, params: { ...p, 'externality-key': KEY }, body: BODY })).status, 401);
+// The key is read by add and /tokens only, from `Authorization: Bearer <key>`; no assertion message carries it.
+test('bearer: the scheme case-insensitively, the key trimmed; another scheme, an empty value, the old header and the parameter are missing', async () => {
+  const s = { 'X-Org-Slug': ORG, 'X-Atlas-Slug': 'bearer-atlas', 'X-Item-Slug': 'bearer-item' };
+  for (const [path, body] of [['/add', BODY], ['/tokens', { scope: 'bearer-atlas' }]]) {
+    for (const [label, headers] of [
+      ['Bearer <key>', { ...s, 'Authorization': `Bearer ${KEY}` }],
+      ['BEARER, two spaces, a trailing space', { ...s, 'authorization': `BEARER  ${KEY} ` }],
+    ]) {
+      const r = await call('POST', path, { headers, body });
+      assert.equal(r.status, 201, `${path} ${label}: ${r.json && r.json.error}`);
+    }
+    for (const [label, headers, params, reason] of [
+      ['another scheme', { ...s, 'Authorization': `Basic ${KEY}` }, {}, 'missing externality key'],
+      ['the scheme alone', { ...s, 'Authorization': 'Bearer' }, {}, 'missing externality key'],
+      ['the scheme and a space', { ...s, 'Authorization': 'Bearer ' }, {}, 'missing externality key'],
+      ['a tab after the scheme', { ...s, 'Authorization': `Bearer\t${KEY}` }, {}, 'missing externality key'],
+      ['the old header', { ...s, 'X-Externality-Key': KEY }, {}, 'missing externality key'],
+      ['the parameter', s, { 'externality-key': KEY }, 'missing externality key'],
+      ['a wrong key', { ...s, 'Authorization': 'Bearer wrong' }, {}, 'wrong externality key'],
+      ['another org', { ...s, 'X-Org-Slug': 'other', 'Authorization': `Bearer ${KEY}` }, {}, 'org slug does not match the key'],
+    ]) {
+      const r = await call('POST', path, { headers, params, body });
+      assert.equal(r.status, 401, `${path} ${label}`);
+      assert.equal(r.json.error, reason, `${path} ${label}`);
+    }
+  }
 });
 
 for (const [name, header, param, field] of [
@@ -248,7 +266,7 @@ for (const [name, header, param, field] of [
 ]) {
   test(`precedence: ${name} from header, param, header wins`, async () => {
     const other = name === 'atlas-slug' ? { 'X-Item-Slug': 'prec-item' } : { 'X-Atlas-Slug': 'prec-atlas' };
-    const base = { 'X-Org-Slug': ORG, 'X-Externality-Key': KEY, ...other };
+    const base = { 'X-Org-Slug': ORG, 'Authorization': `Bearer ${KEY}`, ...other };
     let r = await call('POST', '/add', { headers: { ...base, [header]: 'from-header' }, body: BODY });
     assert.equal(r.json.record[field], 'from-header');
     r = await call('POST', '/add', { headers: base, params: { [param]: 'from-param' }, body: BODY });
@@ -261,9 +279,9 @@ for (const [name, header, param, field] of [
 
 test('auth: wrong key, missing key, other org are 401 with a reason', async () => {
   for (const headers of [
-    { 'X-Org-Slug': ORG, 'X-Externality-Key': 'wrong' },
+    { 'X-Org-Slug': ORG, 'Authorization': 'Bearer wrong' },
     { 'X-Org-Slug': ORG },
-    { 'X-Org-Slug': 'another-org', 'X-Externality-Key': KEY },
+    { 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${KEY}` },
   ]) {
     for (const [method, path, body] of [['GET', '/inventory'], ['POST', '/add', BODY], ['GET', '/status'],
       ['POST', '/update', { id: 'x', what: 'x' }], ['POST', '/tokens', { scope: 'all' }]]) {
@@ -377,7 +395,7 @@ test('auth: status, update and inventory read the token; add and tokens read the
     ['GET', '/inventory', {}],
   ]) {
     const at = `${method} ${path}`;
-    for (const headers of [slugs, { ...slugs, 'X-Org-Slug': ORG }, { ...slugs, 'X-Org-Slug': ORG, 'X-Externality-Key': KEY }]) {
+    for (const headers of [slugs, { ...slugs, 'X-Org-Slug': ORG }, { ...slugs, 'X-Org-Slug': ORG, 'Authorization': `Bearer ${KEY}` }]) {
       const r = await call(method, path, { ...opts, headers });
       assert.equal(r.status, 401, at);
       assert.equal(r.json.error, 'consumer token is required', at);
@@ -390,7 +408,8 @@ test('auth: status, update and inventory read the token; add and tokens read the
     let r = await call(method, path, { ...opts, headers: read('cred-atlas', 'cred-item') });
     assert.equal(r.status, 200, `${at} by header`);
     r = await call(method, path, { ...opts, headers: slugs, params: { ...opts.params, 'consumer-token': TOKEN } });
-    assert.equal(r.status, 200, `${at} by parameter`);
+    assert.equal(r.status, 401, `${at} by parameter`);
+    assert.equal(r.json.error, 'consumer token is required', `${at} by parameter`);
     r = await call(method, path, { ...opts, headers: read('cred-atlas', 'cred-item'), params: { ...opts.params, 'consumer-token': 'not-a-token' } });
     assert.equal(r.status, 200, `${at}: the header wins`);
     r = await call(method, path, { ...opts, headers: unknown, params: { ...opts.params, 'consumer-token': TOKEN } });
@@ -402,14 +421,61 @@ test('auth: status, update and inventory read the token; add and tokens read the
       [read('cred-atlas', 'cred-item'), 'missing externality key'],
       [read('cred-atlas', 'cred-item', { 'X-Org-Slug': ORG }), 'missing externality key'],
       [slugs, 'missing externality key'],
-      [{ ...slugs, 'X-Org-Slug': ORG, 'X-Externality-Key': 'wrong' }, 'wrong externality key'],
-      [{ ...slugs, 'X-Org-Slug': 'another-org', 'X-Externality-Key': KEY }, 'org slug does not match the key'],
+      [{ ...slugs, 'X-Org-Slug': ORG, 'Authorization': 'Bearer wrong' }, 'wrong externality key'],
+      [{ ...slugs, 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${KEY}` }, 'org slug does not match the key'],
     ]) {
       const r = await call('POST', path, { headers, body });
       assert.equal(r.status, 401, `${path}: ${reason}`);
       assert.equal(r.json.error, reason, path);
     }
   }
+});
+
+test("url parameters: externality-key and consumer-token are not read, the slugs' parameters still are", async () => {
+  const id = await addOne('urlp-atlas', 'urlp-item');
+  const slugs = { 'X-Org-Slug': ORG, 'X-Atlas-Slug': 'urlp-atlas', 'X-Item-Slug': 'urlp-item' };
+  const key = { 'externality-key': KEY };
+  const token = { 'consumer-token': TOKEN };
+  for (const [method, path, opts, reason] of [
+    ['POST', '/add', { body: BODY }, 'missing externality key'],
+    ['POST', '/tokens', { body: { scope: 'urlp-atlas' } }, 'missing externality key'],
+    ['GET', '/status', { params: { id } }, 'consumer token is required'],
+    ['POST', '/update', { body: { id, what: 'changed by a parameter' } }, 'consumer token is required'],
+    ['GET', '/inventory', {}, 'consumer token is required'],
+    ['GET', '/token', {}, 'consumer token is required'],
+  ]) {
+    for (const [label, p] of [['externality-key', key], ['consumer-token', token], ['both', { ...key, ...token }]]) {
+      const r = await call(method, path, { ...opts, headers: slugs, params: { ...opts.params, ...p } });
+      assert.equal(r.status, 401, `${method} ${path} by ${label}`);
+      assert.equal(r.json.error, reason, `${method} ${path} by ${label}`);
+    }
+  }
+
+  // The slugs as parameters beside the accepted headers: all three on add, the org slug on tokens and GET /token,
+  // the atlas and item slugs on status, update and inventory.
+  const bearerOnly = { 'Authorization': `Bearer ${KEY}` };
+  const tp = { 'atlas-slug': 'urlp-param-atlas', 'item-slug': 'urlp-param-item' };
+  let r = await call('POST', '/add', { headers: bearerOnly, params: { 'org-slug': ORG, ...tp }, body: BODY });
+  assert.equal(r.status, 201, r.json && r.json.error);
+  assert.equal(r.json.record['atlas-slug'], 'urlp-param-atlas');
+  assert.equal(r.json.record['item-slug'], 'urlp-param-item');
+  const pid = r.json.id;
+  r = await call('POST', '/tokens', { headers: bearerOnly, params: { 'org-slug': ORG }, body: { scope: 'urlp-param-atlas' } });
+  assert.equal(r.status, 201, r.json && r.json.error);
+  r = await call('GET', '/status', { headers: read(), params: { ...tp, id: pid } });
+  assert.equal(r.status, 200, r.json && r.json.error);
+  assert.equal(r.json.record.id, pid);
+  r = await call('POST', '/update', { headers: read(), params: tp, body: { id: pid, what: 'changed under the parameters' } });
+  assert.equal(r.status, 200, r.json && r.json.error);
+  assert.equal(r.json.record.what, 'changed under the parameters');
+  r = await call('GET', '/inventory', { headers: read(), params: tp });
+  assert.equal(r.status, 200, r.json && r.json.error);
+  assert.deepEqual(idsOf(r.json.records), [pid]);
+  r = await call('GET', '/token', { headers: read(), params: { 'org-slug': ORG } });
+  assert.equal(r.status, 200, r.json && r.json.error);
+  r = await call('GET', '/token', { headers: read(), params: { 'org-slug': 'another-org' } });
+  assert.equal(r.status, 401);
+  assert.equal(r.json.error, 'org slug does not match');
 });
 
 test('org slug: optional on a token call, refused when it differs; another org is absent', async () => {
