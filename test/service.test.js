@@ -11,6 +11,8 @@ import { randomBytes } from 'node:crypto';
 import { createServer } from '../src/server.js';
 import { timeoutMs } from '../src/deliver.js';
 import { loadAddressKey } from '../src/auth.js';
+import { networkInterfaces } from 'node:os';
+import { parseAllow, resolveTarget, postOnce, refusedList } from '../src/thirdparty.js';
 
 const ORG = 'test-org';
 const KEY = 'test-key-0123456789';
@@ -1202,4 +1204,465 @@ test('notify: a notice reaches no token address', async () => {
   await sleep(NEGATIVE_WAIT);
   assert.equal(rx.requests.length, 1, 'the notice was not delivered');
   assert.equal(rx.withId(kept.id).length, 0);
+});
+
+// The passing-on: a notice's `3rdparty-notice-url` posted to once, behind the guard. Every receiver here listens on
+// loopback, which the guard refuses, so a server that must post runs with THIRDPARTY_ALLOW=127.0.0.1; each test
+// starts its own, on its own data folder inside the first server's (removed with it). No assertion message carries a part.
+
+const TP = '3rdparty-notice-url';
+const OUTSIDE = '93.184.216.34';
+
+// A server with its notice address on and the given THIRDPARTY_ALLOW (undefined: unset).
+async function tpServer(allow) {
+  const part = randomBytes(32).toString('base64url');
+  const env = { ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, ADDRESS_KEY: part, DATA_DIR: mkdtempSync(join(dataDir, 'tp-')),
+    DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT), ...(allow === undefined ? {} : { THIRDPARTY_ALLOW: allow }) };
+  const s = createServer(env);
+  await new Promise((resolve) => s.listen(0, '127.0.0.1', resolve));
+  const b = `http://127.0.0.1:${s.address().port}`;
+  const req = async (method, path, { headers = {}, raw } = {}) => {
+    const init = { method, headers: { ...headers } };
+    if (raw !== undefined) { init.body = raw; init.headers['content-type'] = 'application/json'; }
+    const res = await fetch(new URL(path, b), init);
+    const text = await res.text();
+    return { status: res.status, json: text ? JSON.parse(text) : null };
+  };
+  return {
+    req,
+    notifyUrl: `${b}/${part}/notify`,
+    notify: (raw, headers) => req('POST', `/${part}/notify`, { raw, headers }),
+    statusOf: (item) => req('GET', `/${part}/status?item=${encodeURIComponent(item)}`),
+    outcome: () => req('GET', '/thirdparty', { headers: auth() }),
+    close: async () => { s.closeAllConnections(); await new Promise((resolve) => s.close(resolve)); },
+  };
+}
+
+const tpNotice = (item, state, url, extra = {}) => JSON.stringify(notice(item, state, url === undefined ? extra : { [TP]: url, ...extra }));
+
+// Polls GET /thirdparty every 50 ms, up to 3 s, until `done` holds.
+async function tpSettled(s, done = (o) => o['last-delivery-status'] !== null) {
+  for (let i = 0; i < 60; i++) {
+    const r = await s.outcome();
+    assert.equal(r.status, 200);
+    if (done(r.json)) return r.json;
+    await sleep(50);
+  }
+  return assert.fail('no third-party outcome settled within 3 s');
+}
+
+const NULL_OUTCOME = { 'last-delivery-date': null, 'last-delivery-status': null };
+
+// A lookup in dns.lookup's form that answers `answer(n)` on its n-th call (an Error fails the call).
+function stubLookup(answer) {
+  const fn = (hostname, options, callback) => {
+    if (typeof options === 'function') { callback = options; options = {}; }
+    fn.calls += 1;
+    const list = answer(fn.calls);
+    process.nextTick(() => {
+      if (list instanceof Error) callback(list);
+      else if (options?.all) callback(null, list);
+      else callback(null, list[0].address, list[0].family);
+    });
+  };
+  fn.calls = 0;
+  return fn;
+}
+
+test('thirdparty: one post per opened and per cleared notice, the text as received, JSON, no authorization header', async () => {
+  const rx = await receiver();
+  const s = await tpServer('127.0.0.1');
+  try {
+    const texts = [
+      `{"item": "feature/tp-post",  "state":"open", "what":"w", "${TP}": "${rx.url}", "n": 1.50}`,
+      `{ "state":"cleared","item":"feature/tp-post","what":"w","${TP}":"${rx.url}" ,"n":2.0 }`,
+    ];
+    for (const [i, raw] of texts.entries()) {
+      const r = await s.notify(raw, i === 1 ? { 'Authorization': 'Bearer notice-side-0123' } : {});
+      assert.equal(r.status, 201, JSON.stringify(r.json));
+      for (let k = 0; k < 60 && rx.requests.length <= i; k++) await sleep(50);
+    }
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rx.requests.length, 2, 'one post per notice');
+    for (const [i, q] of rx.requests.entries()) {
+      assert.equal(q.body, texts[i], 'the text as received');
+      assert.equal(q.headers['content-type'], 'application/json');
+      assert.equal(q.headers['content-length'], String(Buffer.byteLength(texts[i])));
+      assert.equal('authorization' in q.headers, false, 'no authorization header');
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('thirdparty: no retry after a third party that fails or stays silent', async () => {
+  const failing = await receiver(500);
+  const silent = await receiver(null);
+  const s = await tpServer('127.0.0.1');
+  try {
+    for (const rx of [failing, silent]) {
+      assert.equal((await s.notify(tpNotice('feature/tp-retry', 'open', rx.url))).status, 201);
+    }
+    await sleep(DELIVERY_TIMEOUT * 4);
+    assert.equal(failing.requests.length, 1, 'a 500 is not retried');
+    assert.equal(silent.sockets.size, 1, 'a silent third party is connected to once');
+    assert.equal(silent.requests.length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test('thirdparty: the notice is answered and kept with a slow, a failing and a refusing third party', async () => {
+  const slow = await receiver(null);
+  const failing = await receiver(500);
+  const s = await tpServer('127.0.0.1');
+  try {
+    for (const [label, url] of [['slow', slow.url], ['failing', failing.url], ['refusing', await closedPortUrl()]]) {
+      const item = `feature/tp-nowait-${label}`;
+      const started = performance.now();
+      const r = await s.notify(tpNotice(item, 'open', url));
+      const elapsed = performance.now() - started;
+      assert.equal(r.status, 201, label);
+      assert.deepEqual(Object.keys(r.json), ['id'], label);
+      assert.ok(elapsed < DELIVERY_TIMEOUT, `${label}: answered in ${Math.round(elapsed)} ms, before the timeout`);
+      assert.equal((await s.statusOf(item)).json.length, 1, `${label}: kept`);
+    }
+    const o = await tpSettled(s, (x) => x['last-delivery-status'] === 0);
+    assert.equal(o['last-delivery-status'], 0, 'a refused connection or a timeout is status 0');
+  } finally {
+    await s.close();
+  }
+});
+
+test('thirdparty: a bad address or none gets no post and no outcome, and the notice is kept', async () => {
+  const rx = await receiver();
+  const port = rx.url.split(':')[2].split('/')[0];
+  const s = await tpServer('127.0.0.1');
+  try {
+    for (const [label, url] of [['ftp', `ftp://127.0.0.1:${port}/hook`], ['a bare word', 'thirdparty'], ['a relative path', '/hook'],
+      ['a user and password', `http://user:pw@127.0.0.1:${port}/hook`], ['a user alone', `http://user@127.0.0.1:${port}/hook`],
+      ['a number', 42], ['a list', [rx.url]], ['null', null], ['empty', ''], ['absent', undefined]]) {
+      const item = `feature/tp-bad-${label.replace(/\W+/g, '-')}`;
+      const r = await s.notify(tpNotice(item, 'open', url));
+      assert.equal(r.status, 201, label);
+      assert.equal((await s.statusOf(item)).json.length, 1, `${label}: kept`);
+    }
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rx.requests.length, 0, 'no post');
+    assert.deepEqual((await s.outcome()).json, NULL_OUTCOME, 'no outcome row');
+    // the positive control: the same server posts to the same receiver given a web address
+    assert.equal((await s.notify(tpNotice('feature/tp-bad-control', 'open', rx.url))).status, 201);
+    assert.equal((await tpSettled(s))['last-delivery-status'], 200);
+    assert.equal(rx.requests.length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test('thirdparty: the guard refuses loopback, the IPv4-mapped loopback and localhost at the server: no post, no outcome', async () => {
+  const rx = await receiver();
+  const port = rx.url.split(':')[2].split('/')[0];
+  const s = await tpServer();
+  try {
+    for (const host of ['127.0.0.1', '[::ffff:127.0.0.1]', 'localhost', '[::1]']) {
+      const item = `feature/tp-guard-${host.replace(/\W+/g, '-')}`;
+      assert.equal((await s.notify(tpNotice(item, 'open', `http://${host}:${port}/hook`))).status, 201, host);
+      assert.equal((await s.statusOf(item)).json.length, 1, `${host}: kept`);
+    }
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rx.requests.length, 0, 'no post');
+    assert.deepEqual((await s.outcome()).json, NULL_OUTCOME, 'no outcome row');
+  } finally {
+    await s.close();
+  }
+});
+
+test('thirdparty: one address in each refused range, and the IPv4-mapped loopback, is refused', async () => {
+  const look = stubLookup(() => assert.fail('an address is not resolved'));
+  const allow = parseAllow('');
+  for (const host of ['0.0.0.1', '10.1.2.3', '100.64.0.1', '127.0.0.1', '169.254.169.254', '172.16.0.1', '192.168.1.1', '224.0.0.1',
+    '[::]', '[::1]', '[fc00::1]', '[fe80::1]', '[ff02::1]', '[64:ff9b::1]', '[64:ff9b:1::1]', '[::ffff:127.0.0.1]', '[::ffff:10.0.0.1]',
+    '0x7f.1', '2130706433']) {
+    for (const scheme of ['http', 'https']) {
+      assert.deepEqual(await resolveTarget(`${scheme}://${host}:8443/x`, { lookup: look, allow }), { refused: true }, `${scheme} ${host}`);
+    }
+  }
+  for (const host of [OUTSIDE, '172.32.0.1', '100.128.0.1', '[2606:4700::1]']) {
+    const r = await resolveTarget(`http://${host}/x`, { lookup: look, allow });
+    assert.equal(r.refused, false, host);
+  }
+  assert.equal(look.calls, 0, 'an address given is checked as it stands');
+});
+
+test('thirdparty: a name is resolved once, all its addresses, and refused whole when one is refused', async () => {
+  const allow = parseAllow('');
+  for (const [label, list] of [['loopback', [{ address: '127.0.0.1', family: 4 }]],
+    ['an outside and a loopback address', [{ address: OUTSIDE, family: 4 }, { address: '127.0.0.1', family: 4 }]],
+    ['an outside and a private IPv6 address', [{ address: OUTSIDE, family: 4 }, { address: 'fc00::1', family: 6 }]],
+    ['an IPv4-mapped private address', [{ address: '::ffff:10.0.0.1', family: 6 }]]]) {
+    const look = stubLookup(() => list);
+    assert.deepEqual(await resolveTarget('http://name.test/x', { lookup: look, allow }), { refused: true }, label);
+    assert.equal(look.calls, 1, label);
+  }
+  const look = stubLookup(() => [{ address: OUTSIDE, family: 4 }, { address: '2606:4700::1', family: 6 }]);
+  assert.deepEqual(await resolveTarget('http://name.test/x', { lookup: look, allow }),
+    { refused: false, addresses: [{ address: OUTSIDE, family: 4 }, { address: '2606:4700::1', family: 6 }] });
+  const missing = stubLookup(() => Object.assign(new Error('not found'), { code: 'ENOTFOUND' }));
+  assert.deepEqual(await resolveTarget('http://name.test/x', { lookup: missing, allow }), { refused: false, addresses: [] },
+    'a name that does not resolve is an attempt, not a refusal');
+  assert.equal(await postOnce('http://name.test/x', '{}', { lookup: missing, allow, timeout: DELIVERY_TIMEOUT }), 0);
+});
+
+test('thirdparty: the connection goes to the checked address, the lookup called once', async () => {
+  const rx = await receiver();
+  const port = rx.url.split(':')[2].split('/')[0];
+  const look = stubLookup((n) => [{ address: n === 1 ? '127.0.0.1' : '127.0.0.2', family: 4 }]);
+  const text = '{"item":"feature/tp-pin","state":"open","what":"w"}';
+  const status = await postOnce(`http://name.test:${port}/hook`, text, { lookup: look, allow: parseAllow('127.0.0.1'), timeout: DELIVERY_TIMEOUT });
+  assert.equal(status, 200);
+  assert.equal(look.calls, 1, 'one lookup per post');
+  assert.equal(rx.requests.length, 1);
+  assert.equal(rx.requests[0].body, text);
+  // refused: no connection, status 0
+  const refused = stubLookup(() => [{ address: '127.0.0.1', family: 4 }]);
+  assert.equal(await postOnce(`http://name.test:${port}/hook`, text, { lookup: refused, allow: parseAllow(''), timeout: DELIVERY_TIMEOUT }), 0);
+  assert.equal(refused.calls, 1);
+  await sleep(100);
+  assert.equal(rx.requests.length, 1, 'a refused name is not connected to');
+});
+
+test('thirdparty: a redirect is not followed; its 3xx is the outcome', async () => {
+  const target = await receiver();
+  const hits = [];
+  const redirecting = http.createServer((req, res) => {
+    hits.push(req.url);
+    req.resume();
+    req.on('end', () => res.writeHead(302, { location: target.url }).end());
+  });
+  await new Promise((resolve) => redirecting.listen(0, '127.0.0.1', resolve));
+  const s = await tpServer('127.0.0.1');
+  try {
+    const url = `http://127.0.0.1:${redirecting.address().port}/hook`;
+    assert.equal((await s.notify(tpNotice('feature/tp-redirect', 'open', url))).status, 201);
+    const o = await tpSettled(s);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(o['last-delivery-status'], 302);
+    assert.equal(hits.length, 1);
+    assert.equal(target.requests.length, 0, 'the redirect target receives nothing');
+    assert.equal(await postOnce(url, '{}', { lookup: stubLookup(() => assert.fail('no lookup')), allow: parseAllow('127.0.0.1'), timeout: DELIVERY_TIMEOUT }), 302);
+    assert.equal(target.requests.length, 0);
+  } finally {
+    await s.close();
+    redirecting.closeAllConnections();
+    await new Promise((resolve) => redirecting.close(resolve));
+  }
+});
+
+test('thirdparty: THIRDPARTY_ALLOW exempts an address, a subnet and a trimmed list; the web-address rule still applies', async () => {
+  const look = stubLookup(() => assert.fail('an address is not resolved'));
+  for (const [allowText, host] of [['127.0.0.1', '127.0.0.1'], ['127.0.0.0/8', '127.0.0.5'], [' 10.0.0.1 , ::1 ', '[::1]'],
+    [' 10.0.0.1 , ::1 ', '10.0.0.1'], ['fc00::/7', '[fd12::1]'], ['10.0.0.0/8', '[::ffff:10.9.9.9]']]) {
+    const r = await resolveTarget(`http://${host}/x`, { lookup: look, allow: parseAllow(allowText) });
+    assert.equal(r.refused, false, `${host} under ${JSON.stringify(allowText)}`);
+  }
+  for (const [allowText, host] of [['127.0.0.1', '127.0.0.2'], ['10.0.0.1', '10.0.0.2'], ['::1', '127.0.0.1'], ['', '127.0.0.1']]) {
+    assert.deepEqual(await resolveTarget(`http://${host}/x`, { lookup: look, allow: parseAllow(allowText) }), { refused: true },
+      `${host} under ${JSON.stringify(allowText)}`);
+  }
+  const allow = parseAllow('127.0.0.1');
+  for (const url of ['ftp://127.0.0.1/x', 'http://u:p@127.0.0.1/x', 'not a url']) {
+    assert.deepEqual(await resolveTarget(url, { lookup: look, allow }), { refused: true }, url);
+  }
+  const name = stubLookup(() => [{ address: '127.0.0.1', family: 4 }]);
+  assert.equal((await resolveTarget('http://name.test/x', { lookup: name, allow })).refused, false, 'a resolved address is exempt too');
+});
+
+test('thirdparty: THIRDPARTY_ALLOW takes addresses and subnets only; anything else is refused, naming it', () => {
+  for (const ok of ['', '127.0.0.1', '10.0.0.0/8', '::1', 'fc00::/7', ' 127.0.0.1 , ::1 ', '0.0.0.0/0']) {
+    assert.doesNotThrow(() => parseAllow(ok), JSON.stringify(ok));
+  }
+  for (const bad of ['localhost', 'example.com', '999.1.1.1', '10.0.0.0/99', '::1/129', '10.0.0.0/', '10.0.0.0/x', '1.2.3.4/8/8',
+    '127.0.0.1,', ',', ' ', 'http://127.0.0.1']) {
+    assert.throws(() => parseAllow(bad), /THIRDPARTY_ALLOW/, JSON.stringify(bad));
+  }
+});
+
+test('the server refuses to start with a bad THIRDPARTY_ALLOW, naming it', () => {
+  for (const allow of ['localhost', '999.1.1.1', '10.0.0.0/99']) {
+    const r = spawnSync(process.execPath, ['src/server.js'], {
+      cwd: ROOT,
+      env: { PATH: process.env.PATH, ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, THIRDPARTY_ALLOW: allow, DATA_DIR: dataDir, PORT: '0' },
+      timeout: 10000,
+      encoding: 'utf8',
+    });
+    assert.notEqual(r.status, 0);
+    assert.notEqual(r.status, null, 'exited on its own');
+    assert.match(r.stderr, /refusing to start: THIRDPARTY_ALLOW/);
+  }
+});
+
+test('GET /thirdparty: refused without the org key; null at first, the latest outcome after, replaced by the next', async () => {
+  const rx = await receiver(200);
+  const s = await tpServer('127.0.0.1');
+  try {
+    for (const headers of [{}, { 'X-Org-Slug': ORG }, { 'X-Org-Slug': ORG, 'Authorization': 'Bearer wrong' },
+      { 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${KEY}` }, { 'X-Consumer-Token': TOKEN }]) {
+      const r = await s.req('GET', '/thirdparty', { headers });
+      assert.equal(r.status, 401);
+      assert.equal(typeof r.json.error, 'string');
+    }
+    const first = await s.outcome();
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.json, NULL_OUTCOME);
+    assert.equal((await s.notify(tpNotice('feature/tp-read', 'open', rx.url))).status, 201);
+    const one = await tpSettled(s);
+    assert.deepEqual(Object.keys(one).sort(), ['last-delivery-date', 'last-delivery-status']);
+    assert.equal(one['last-delivery-status'], 200);
+    assert.match(one['last-delivery-date'], ISO);
+    rx.status = 503;
+    assert.equal((await s.notify(tpNotice('feature/tp-read', 'cleared', rx.url))).status, 201);
+    const two = await tpSettled(s, (x) => x['last-delivery-status'] === 503);
+    assert.match(two['last-delivery-date'], ISO);
+    assert.ok(two['last-delivery-date'] >= one['last-delivery-date'], 'the later attempt dated no earlier');
+  } finally {
+    await s.close();
+  }
+});
+
+test('thirdparty: a notice with an address reaches no token address', async () => {
+  const third = await receiver();
+  const tokenRx = await receiver();
+  const s = await tpServer('127.0.0.1');
+  try {
+    assert.equal((await s.req('POST', '/tokens', { headers: auth(), raw: JSON.stringify({ scope: 'all', url: tokenRx.url }) })).status, 201);
+    const added = await s.req('POST', '/add', { headers: auth('none', 'feature/tp-token'), raw: JSON.stringify(BODY) });
+    assert.equal(added.status, 201);
+    for (let i = 0; i < 60 && tokenRx.requests.length === 0; i++) await sleep(50);
+    assert.equal(tokenRx.withId(added.json.id).length, 1, 'positive control: the add was delivered');
+    assert.equal((await s.notify(tpNotice('feature/tp-token', 'open', third.url))).status, 201);
+    await tpSettled(s);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(third.requests.length, 1, 'the third party got the notice');
+    assert.equal(tokenRx.requests.length, 1, 'the token address got nothing more');
+  } finally {
+    await s.close();
+  }
+});
+
+// The loop guard: every post carries `x-externality-passed-on: 1`; a notice arriving with it is kept, never passed on.
+const PASSED = 'x-externality-passed-on';
+
+test('thirdparty: the post a notice produces carries x-externality-passed-on: 1, still JSON with no authorization', async () => {
+  const rx = await receiver();
+  const s = await tpServer('127.0.0.1');
+  try {
+    assert.equal((await s.notify(tpNotice('feature/tp-header', 'open', rx.url))).status, 201);
+    for (let i = 0; i < 60 && rx.requests.length === 0; i++) await sleep(50);
+    assert.equal(rx.requests.length, 1);
+    const q = rx.requests[0];
+    assert.equal(q.headers[PASSED], '1');
+    assert.equal(q.headers['content-type'], 'application/json');
+    assert.equal('authorization' in q.headers, false, 'no authorization header');
+  } finally {
+    await s.close();
+  }
+});
+
+test('thirdparty: a notice carrying x-externality-passed-on, any value, is kept and answered but not passed on', async () => {
+  const rx = await receiver();
+  const s = await tpServer('127.0.0.1');
+  try {
+    for (const [label, value] of [['one', '1'], ['other', 'no'], ['empty', '']]) {
+      const item = `feature/tp-passed-${label}`;
+      const r = await s.notify(tpNotice(item, 'open', rx.url), { [PASSED]: value });
+      assert.equal(r.status, 201, label);
+      assert.deepEqual(Object.keys(r.json), ['id'], label);
+      assert.equal((await s.statusOf(item)).json.length, 1, `${label}: kept`);
+    }
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rx.requests.length, 0, 'not passed on');
+    assert.deepEqual((await s.outcome()).json, NULL_OUTCOME, 'no outcome row');
+    // the positive control: the same notice without the header is passed on
+    assert.equal((await s.notify(tpNotice('feature/tp-passed-control', 'open', rx.url))).status, 201);
+    assert.equal((await tpSettled(s))['last-delivery-status'], 200);
+    assert.equal(rx.requests.length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test('thirdparty: a notice naming the service\'s own notice address is kept twice, the original and one copy, no more', async () => {
+  const s = await tpServer('127.0.0.1');
+  try {
+    const item = 'feature/tp-self';
+    assert.equal((await s.notify(tpNotice(item, 'open', s.notifyUrl))).status, 201);
+    for (let i = 0; i < 60 && (await s.statusOf(item)).json.length < 2; i++) await sleep(50);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal((await s.statusOf(item)).json.length, 2, 'the original and one copy');
+    assert.equal((await tpSettled(s))['last-delivery-status'], 201, 'the copy was posted and kept');
+    await sleep(NEGATIVE_WAIT);
+    assert.equal((await s.statusOf(item)).json.length, 2, 'the count is stable');
+  } finally {
+    await s.close();
+  }
+});
+
+// This machine's non-internal interface addresses, those the ranges alone do not refuse first.
+function ownAddresses() {
+  const ranges = refusedList({});
+  const list = Object.values(networkInterfaces()).flat().filter((x) => x && !x.internal)
+    .map((x) => String(x.address).replace(/%.*$/, ''))
+    .map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+  const inRanges = (x) => Number(ranges.check(x.address, x.family === 4 ? 'ipv4' : 'ipv6'));
+  return list.sort((a, b) => inRanges(a) - inRanges(b));
+}
+
+test('thirdparty: the machine\'s own interface address is refused, given or resolved; an exemption still applies', async (t) => {
+  const own = ownAddresses();
+  if (own.length === 0) {
+    t.skip('this machine has no non-internal interface address; the mechanism is tested through refusedList');
+    return;
+  }
+  const { address, family } = own[0];
+  if (refusedList({}).check(address, family === 4 ? 'ipv4' : 'ipv6')) {
+    t.diagnostic(`every own address here (${address} first) is in the ranges too; the own-address set is shown by refusedList's test`);
+  }
+  const host = family === 6 ? `[${address}]` : address;
+  const look = stubLookup(() => assert.fail('an address is not resolved'));
+  assert.deepEqual(await resolveTarget(`http://${host}:8443/x`, { lookup: look, allow: parseAllow('') }), { refused: true }, `own address ${address}`);
+  const name = stubLookup(() => [{ address: OUTSIDE, family: 4 }, { address, family }]);
+  assert.deepEqual(await resolveTarget('http://name.test/x', { lookup: name, allow: parseAllow('') }), { refused: true }, `a name resolving to ${address}`);
+  assert.equal(name.calls, 1);
+  assert.equal((await resolveTarget(`http://${host}/x`, { lookup: look, allow: parseAllow(address) })).refused, false, 'an exempt own address passes');
+});
+
+test('thirdparty: refusedList holds the ranges and each interface address as a single address in its family', () => {
+  const list = refusedList({
+    en0: [{ address: '203.0.113.7', family: 'IPv4', internal: false }, { address: '2001:db8::7', family: 'IPv6', internal: false },
+      { address: 'fe80::1%en0', family: 'IPv6', internal: false }],
+    lo0: [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
+  });
+  assert.equal(list.check('203.0.113.7', 'ipv4'), true);
+  assert.equal(list.check('2001:db8::7', 'ipv6'), true);
+  assert.equal(list.check('203.0.113.8', 'ipv4'), false, 'a single address, not a subnet');
+  assert.equal(list.check('2001:db8::8', 'ipv6'), false, 'a single address, not a subnet');
+  assert.equal(list.check('10.0.0.1', 'ipv4'), true, 'the ranges stay');
+  const bare = refusedList({});
+  assert.equal(bare.check('203.0.113.7', 'ipv4'), false, 'without the interface, not refused');
+  assert.equal(bare.check('127.0.0.1', 'ipv4'), true);
+});
+
+test('thirdparty: an exemption covers its own address family only', async () => {
+  const look = stubLookup(() => assert.fail('an address is not resolved'));
+  for (const text of ['::/1', '::/0']) {
+    const allow = parseAllow(text);
+    for (const host of ['127.0.0.1', '10.0.0.1', '[::ffff:127.0.0.1]']) {
+      assert.deepEqual(await resolveTarget(`http://${host}/x`, { lookup: look, allow }), { refused: true }, `${host} under ${text}`);
+    }
+    assert.equal((await resolveTarget('http://[::1]/x', { lookup: look, allow })).refused, false, `::1 under ${text}`);
+    const name = stubLookup(() => [{ address: '127.0.0.1', family: 4 }]);
+    assert.deepEqual(await resolveTarget('http://name.test/x', { lookup: name, allow }), { refused: true }, `a name to 127.0.0.1 under ${text}`);
+  }
+  assert.deepEqual(await resolveTarget('http://[::1]/x', { lookup: look, allow: parseAllow('127.0.0.0/8') }), { refused: true }, '::1 under 127.0.0.0/8');
+  assert.equal((await resolveTarget('http://127.0.0.1/x', { lookup: look, allow: parseAllow('127.0.0.0/8') })).refused, false, 'the IPv4 entry still exempts');
 });
