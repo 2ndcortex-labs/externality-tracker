@@ -7,8 +7,10 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { createServer } from '../src/server.js';
 import { timeoutMs } from '../src/deliver.js';
+import { loadAddressKey } from '../src/auth.js';
 
 const ORG = 'test-org';
 const KEY = 'test-key-0123456789';
@@ -922,4 +924,282 @@ test('timeoutMs: 10000 by default, the variable when a positive integer, else 10
   assert.equal(timeoutMs({ DELIVERY_TIMEOUT_MS: 'abc' }), 10000);
   assert.equal(timeoutMs({ DELIVERY_TIMEOUT_MS: '0' }), 10000);
   assert.equal(timeoutMs({ DELIVERY_TIMEOUT_MS: '-5' }), 10000);
+});
+
+// The two open addresses, `/<part>/notify` and `/<part>/status`. The server above runs without ADDRESS_KEY, so its
+// addresses are off; a second server runs with a part, on its own data folder inside the first one's (removed with it).
+// No assertion message below carries the part.
+
+const PART = randomBytes(32).toString('base64url');
+const NOT_FOUND = { status: 404, json: { error: 'not found' } };
+const RECORD = 'the body must be a JSON record of named fields';
+const ITEM_MSG = "item must be a non-empty text, the item's reference";
+const WHAT_MSG = 'what must be a non-empty text';
+const REQUIRED_MSG = "item is required: the item's reference";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+let partServer;
+let partBase;
+let partDir;
+
+before(async () => {
+  partDir = join(dataDir, 'addresses');
+  partServer = createServer({ ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, ADDRESS_KEY: PART, DATA_DIR: partDir, DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT) });
+  await new Promise((resolve) => partServer.listen(0, '127.0.0.1', resolve));
+  partBase = `http://127.0.0.1:${partServer.address().port}`;
+});
+
+after(async () => {
+  await new Promise((resolve) => partServer.close(resolve));
+});
+
+// A call to the server with the part; `raw` is sent as the body text when given.
+async function at(method, path, { headers = {}, body, raw } = {}) {
+  const init = { method, headers: { ...headers } };
+  if (raw !== undefined) init.body = raw;
+  else if (body !== undefined) init.body = JSON.stringify(body);
+  if (init.body !== undefined) init.headers['content-type'] = 'application/json';
+  const res = await fetch(new URL(path, partBase), init);
+  const text = await res.text();
+  return { status: res.status, json: text ? JSON.parse(text) : null };
+}
+
+const statusPath = (item) => `/${PART}/status${item === undefined ? '' : `?item=${encodeURIComponent(item)}`}`;
+
+async function post(body) {
+  const r = await at('POST', `/${PART}/notify`, { body });
+  assert.equal(r.status, 201, JSON.stringify(r.json));
+  return r.json;
+}
+
+async function statusOf(item) {
+  const r = await at('GET', statusPath(item));
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.ok(Array.isArray(r.json));
+  return r.json;
+}
+
+const notice = (item, state, extra = {}) => ({
+  'what': 'a vendor key is issued', 'who-acts': 'the vendor', 'how-observed': 'the key works', state, item,
+  'set-date': '2026-11-17T09:00:00.000Z', 'cleared-date': null, 'cleared-words': null, 'atlas': 'none', ...extra,
+});
+
+test('ADDRESS_KEY: unset or empty is off; letters, digits, - and _, 32 or more is taken; anything else is refused', () => {
+  assert.equal(loadAddressKey({}), '');
+  assert.equal(loadAddressKey({ ADDRESS_KEY: '' }), '');
+  for (const ok of ['a'.repeat(32), 'A-b_9'.repeat(7), PART]) assert.equal(loadAddressKey({ ADDRESS_KEY: ok }), ok);
+  for (const bad of ['a'.repeat(31), `${'a'.repeat(31)}.`, `${'a'.repeat(31)}/`, `${'a'.repeat(31)} `, ` ${'a'.repeat(32)}`, `${'a'.repeat(31)}é`]) {
+    assert.throws(() => loadAddressKey({ ADDRESS_KEY: bad }), /ADDRESS_KEY/, `a part of ${bad.length} characters`);
+  }
+});
+
+test('the server refuses to start with a bad ADDRESS_KEY, naming it', () => {
+  for (const part of ['a'.repeat(31), `${'a'.repeat(31)}.`]) {
+    const r = spawnSync(process.execPath, ['src/server.js'], {
+      cwd: ROOT,
+      env: { PATH: process.env.PATH, ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, ADDRESS_KEY: part, DATA_DIR: dataDir, PORT: '0' },
+      timeout: 10000,
+      encoding: 'utf8',
+    });
+    assert.notEqual(r.status, 0);
+    assert.notEqual(r.status, null, 'exited on its own');
+    assert.match(r.stderr, /refusing to start: ADDRESS_KEY/);
+  }
+});
+
+test('addresses: off without ADDRESS_KEY, both answering as an unknown route', async () => {
+  assert.deepEqual(await call('GET', '/elsewhere'), NOT_FOUND);
+  assert.deepEqual(await call('POST', `/${PART}/notify`, { body: notice('feature/off', 'open') }), NOT_FOUND);
+  assert.deepEqual(await call('GET', statusPath('feature/off')), NOT_FOUND);
+});
+
+test('addresses: on with ADDRESS_KEY, both answer; the present routes still answer', async () => {
+  assert.deepEqual(Object.keys(await post(notice('feature/on', 'open'))), ['id']);
+  assert.equal((await statusOf('feature/on')).length, 1);
+  assert.equal((await at('GET', '/')).status, 200);
+  assert.deepEqual(await at('GET', '/inventory'), { status: 401, json: { error: 'consumer token is required' } });
+});
+
+test('addresses: a wrong part, another method or a near path answers as an unknown route', async () => {
+  assert.deepEqual(await at('GET', '/elsewhere'), NOT_FOUND);
+  let wrong = randomBytes(32).toString('base64url');
+  while (wrong === PART) wrong = randomBytes(32).toString('base64url');
+  const body = notice('feature/wrong', 'open');
+  for (const [method, path, opts] of [
+    ['POST', `/${wrong}/notify`, { body }],
+    ['GET', `/${wrong}/status?item=feature%2Fwrong`],
+    ['POST', `/${PART.slice(0, -1)}/notify`, { body }],
+    ['POST', `/${PART}x/notify`, { body }],
+    ['POST', `/${PART}/notify/`, { body }],
+    ['POST', `/x/${PART}/notify`, { body }],
+    ['POST', `/${PART}`, { body }],
+    ['GET', `/${PART}/notify`],
+    ['POST', `/${PART}/status?item=feature%2Fwrong`, { body }],
+    ['PUT', `/${PART}/notify`, { body }],
+    ['DELETE', `/${PART}/status?item=feature%2Fwrong`],
+  ]) {
+    assert.deepEqual(await at(method, path, opts), NOT_FOUND, `${method} at a wrong address`);
+  }
+  assert.deepEqual(await statusOf('feature/wrong'), [], 'nothing was kept');
+});
+
+test('addresses: no credential is read; one sent is ignored', async () => {
+  const item = 'feature/no-credential';
+  const variants = [{}, { 'Authorization': 'Bearer wrong', 'X-Consumer-Token': 'wrong', 'X-Org-Slug': 'another-org' },
+    { 'Authorization': `Bearer ${KEY}`, 'X-Org-Slug': ORG }];
+  for (const [i, headers] of variants.entries()) {
+    const r = await at('POST', `/${PART}/notify`, { headers, body: notice(item, 'open', { what: `posted ${i}` }) });
+    assert.equal(r.status, 201, `notice ${i}`);
+  }
+  const reads = [];
+  for (const headers of variants) {
+    const r = await at('GET', statusPath(item), { headers });
+    assert.equal(r.status, 200);
+    reads.push(r.json);
+  }
+  assert.equal(reads[0].length, 3);
+  assert.deepEqual(reads[1], reads[0]);
+  assert.deepEqual(reads[2], reads[0]);
+});
+
+test('notify: a kept notice answers 201 with its id alone; two notices, two ids; one row each', async () => {
+  const item = 'feature/ids';
+  const one = await post(notice(item, 'open'));
+  const two = await post(notice(item, 'open'));
+  for (const r of [one, two]) {
+    assert.deepEqual(Object.keys(r), ['id']);
+    assert.match(r.id, UUID);
+  }
+  assert.notEqual(one.id, two.id);
+  const db = new DatabaseSync(join(partDir, 'externalities.sqlite'));
+  try {
+    const columns = db.prepare('PRAGMA table_info(notices)').all().map((c) => c.name);
+    assert.deepEqual(columns, ['id', 'item', 'state', 'what', 'body', 'received']);
+    const rows = db.prepare('SELECT * FROM notices WHERE item = ?').all(item);
+    assert.deepEqual(rows.map((r) => r.id).sort(), [one.id, two.id].sort());
+    for (const row of rows) {
+      assert.equal(row.state, 'open');
+      assert.equal(row.what, 'a vendor key is issued');
+      assert.deepEqual(JSON.parse(row.body), notice(item, 'open'));
+      assert.match(row.received, ISO);
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test('notify: kept as sent, a record of only item, state and what, and one with extra fields', async () => {
+  const minimal = { item: 'feature/kept-minimal', state: 'cleared', what: ' a key ' };
+  const extra = {
+    'item': 'feature/kept-extra', 'state': 'open', 'what': 'a key is issued', 'nested': { list: [1, 'two', { three: null }] },
+    'count': 42.5, 'nothing': null, 'flag': false, 'unknown-name': 'kept', 'cleared-words': 7,
+  };
+  for (const body of [minimal, extra]) {
+    await post(body);
+    assert.deepEqual(await statusOf(body.item), [body]);
+  }
+});
+
+test('status: a body that does not survive a JavaScript round trip comes back as the very text sent', async () => {
+  const raw = '{"item":"feature/n","state":"open","what":"w","n":12345678901234567890,"m":1e400,"dup":1,"dup":2}';
+  assert.equal((await at('POST', `/${PART}/notify`, { raw })).status, 201);
+  const res = await fetch(new URL(statusPath('feature/n'), partBase));
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.ok(text.includes('12345678901234567890'));
+  assert.equal(text, `[${raw}]`);
+});
+
+test('notify: each refused post answers 400 with its message, and is not kept', async () => {
+  const item = 'feature/refused';
+  const ok = { item, state: 'open', what: 'w' };
+  for (const [label, raw, message] of [
+    ['a blank body', '', RECORD],
+    ['a body of spaces', '  \n', RECORD],
+    ['not JSON', '{"item": "feature/refused", not json', RECORD],
+    ['a list', JSON.stringify([ok]), `${RECORD}; got a list`],
+    ['a text', '"feature/refused"', `${RECORD}; got a text`],
+    ['a number', '42', `${RECORD}; got a number`],
+    ['a boolean', 'true', `${RECORD}; got a boolean`],
+    ['null', 'null', `${RECORD}; got null`],
+    ['no item', JSON.stringify({ state: 'open', what: 'w' }), ITEM_MSG],
+    ['an item of spaces', JSON.stringify({ ...ok, item: '   ' }), ITEM_MSG],
+    ['an item not a text', JSON.stringify({ ...ok, item: 5 }), ITEM_MSG],
+    ['a state of Open', JSON.stringify({ ...ok, state: 'Open' }), 'state must be open or cleared; got Open'],
+    ['no state', JSON.stringify({ item, what: 'w' }), 'state must be open or cleared; got nothing'],
+    ['a state of 1', JSON.stringify({ ...ok, state: 1 }), 'state must be open or cleared; got 1'],
+    ['a state of null', JSON.stringify({ ...ok, state: null }), 'state must be open or cleared; got null'],
+    ['no what', JSON.stringify({ item, state: 'open' }), WHAT_MSG],
+    ['a what of spaces', JSON.stringify({ ...ok, what: ' ' }), WHAT_MSG],
+    ['no item and a state of done', JSON.stringify({ state: 'done', what: 'w' }), `${ITEM_MSG}; state must be open or cleared; got done`],
+    ['an empty record', '{}', `${ITEM_MSG}; state must be open or cleared; got nothing; ${WHAT_MSG}`],
+    ['too large', JSON.stringify({ ...ok, pad: 'x'.repeat(1024 * 1024) }), 'body too large'],
+  ]) {
+    const r = await at('POST', `/${PART}/notify`, { raw });
+    assert.equal(r.status, 400, label);
+    assert.deepEqual(r.json, { error: message }, label);
+  }
+  assert.deepEqual(await statusOf(item), []);
+});
+
+test('status: an open and a cleared notice both kept, newest first; the reference matched exactly', async () => {
+  const item = 'feature/pair';
+  const opened = notice(item, 'open');
+  const cleared = notice(item, 'cleared', { 'cleared-date': '2026-11-17T10:00:00.000Z', 'cleared-words': 'the key arrived' });
+  await post(opened);
+  await sleep(5);
+  await post(cleared);
+  assert.deepEqual(await statusOf(item), [cleared, opened]);
+  for (const other of ['Feature/Pair', 'feature/pair ', ' feature/pair', 'feature/pai', 'pair']) {
+    assert.deepEqual(await statusOf(other), [], JSON.stringify(other));
+  }
+  const spaced = 'feature/a name with spaces & more';
+  await post(notice(spaced, 'open'));
+  assert.equal((await statusOf(spaced)).length, 1, 'the reference is URL-decoded');
+});
+
+test('status: rows received in one instant read the later-inserted first', async () => {
+  const item = 'feature/same-instant';
+  const db = new DatabaseSync(join(partDir, 'externalities.sqlite'));
+  try {
+    const insert = db.prepare('INSERT INTO notices (id, item, state, what, body, received) VALUES (?, ?, ?, ?, ?, ?)');
+    for (const [id, state] of [['z-first', 'open'], ['a-second', 'cleared']]) {
+      insert.run(id, item, state, 'w', JSON.stringify({ item, state, what: 'w', id }), '2026-11-17T09:00:00.000Z');
+    }
+  } finally {
+    db.close();
+  }
+  assert.deepEqual((await statusOf(item)).map((e) => e.id), ['a-second', 'z-first']);
+});
+
+test('status: an unknown reference is an empty list; a missing or empty one is refused', async () => {
+  assert.deepEqual(await statusOf('feature/never-noticed'), []);
+  for (const path of [statusPath(), `/${PART}/status?item=`, `/${PART}/status?other=feature%2Fpair`]) {
+    assert.deepEqual(await at('GET', path), { status: 400, json: { error: REQUIRED_MSG } });
+  }
+});
+
+test('status: a record added by POST /add stays on inventory and is in no status read', async () => {
+  const item = 'feature/old-kind';
+  const r = await at('POST', '/add', { headers: auth('none', item), body: BODY });
+  assert.equal(r.status, 201, JSON.stringify(r.json));
+  assert.deepEqual(await statusOf(item), []);
+  const token = (await at('POST', '/tokens', { headers: auth(), body: { scope: 'all' } })).json.token;
+  const inv = await at('GET', '/inventory', { headers: byToken(token, 'none', item) });
+  assert.equal(inv.status, 200);
+  assert.deepEqual(inv.json.records.map((rec) => rec.id), [r.json.id]);
+});
+
+test('notify: a notice reaches no token address', async () => {
+  const rx = await receiver();
+  const m = await at('POST', '/tokens', { headers: auth(), body: { scope: 'all', url: rx.url } });
+  assert.equal(m.status, 201);
+  const added = await at('POST', '/add', { headers: auth('none', 'feature/no-delivery'), body: BODY });
+  assert.equal(added.status, 201);
+  for (let i = 0; i < 60 && rx.requests.length === 0; i++) await sleep(50);
+  assert.equal(rx.withId(added.json.id).length, 1, 'positive control: the add was delivered');
+  const kept = await post(notice('feature/no-delivery', 'open'));
+  await sleep(NEGATIVE_WAIT);
+  assert.equal(rx.requests.length, 1, 'the notice was not delivered');
+  assert.equal(rx.withId(kept.id).length, 0);
 });

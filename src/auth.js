@@ -21,6 +21,21 @@ export function loadAuthConfig(env) {
   return { org, key };
 }
 
+// The hard-to-guess part of the two open addresses: '' when ADDRESS_KEY is unset or empty (the addresses off),
+// else letters, digits, - and _ only, 32 characters or more; any other value stops the start.
+export function loadAddressKey(env) {
+  const part = env.ADDRESS_KEY ?? '';
+  if (part !== '' && !/^[A-Za-z0-9_-]{32,}$/.test(part)) {
+    throw new Error('ADDRESS_KEY must be letters, digits, - and _ only, 32 characters or more');
+  }
+  return part;
+}
+
+// The part of a call against the configured one, in constant time; never true while the addresses are off.
+export function matchesPart(given, part) {
+  return part !== '' && safeEqual(given, part);
+}
+
 // The org key from `Authorization: Bearer <key>`: the scheme in any case, then spaces only, the key trimmed.
 function bearer(req) {
   const h = req.headers.authorization;

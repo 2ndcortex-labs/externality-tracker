@@ -1,0 +1,63 @@
+// The two open addresses: a notice taken as sent once it passes the test, and the status read by an item's reference.
+// Neither reads a credential; the hard-to-guess part in the path is their only guard (see server.js).
+import { randomUUID } from 'node:crypto';
+import { HttpError } from './auth.js';
+
+const RECORD = 'the body must be a JSON record of named fields';
+const STATES = ['open', 'cleared'];
+
+function isText(v) {
+  return typeof v === 'string' && v.trim() !== '';
+}
+
+// What a JSON value that is not a record is called in the refusal.
+function kindOf(v) {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'a list';
+  if (typeof v === 'string') return 'a text';
+  if (typeof v === 'number') return 'a number';
+  return 'a boolean';
+}
+
+// The state as the refusal names it: the text as sent, `nothing` when absent, its JSON form otherwise.
+function shown(body) {
+  if (!Object.hasOwn(body, 'state')) return 'nothing';
+  return typeof body.state === 'string' ? body.state : JSON.stringify(body.state);
+}
+
+// Returns the parsed record, else throws the 400 naming every failed part, in the order item, state, what.
+export function test(text) {
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new HttpError(400, RECORD);
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new HttpError(400, `${RECORD}; got ${kindOf(body)}`);
+  }
+  const failed = [];
+  if (!isText(Object.hasOwn(body, 'item') ? body.item : undefined)) failed.push("item must be a non-empty text, the item's reference");
+  if (!Object.hasOwn(body, 'state') || !STATES.includes(body.state)) failed.push(`state must be open or cleared; got ${shown(body)}`);
+  if (!isText(Object.hasOwn(body, 'what') ? body.what : undefined)) failed.push('what must be a non-empty text');
+  if (failed.length) throw new HttpError(400, failed.join('; '));
+  return body;
+}
+
+// Keeps the notice as its own row, the body's text as received; answers its id and nothing else.
+export function keep(db, text) {
+  const body = test(text);
+  const id = randomUUID();
+  db.prepare('INSERT INTO notices (id, item, state, what, body, received) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(id, body.item, body.state, body.what, text, new Date().toISOString());
+  return [201, { id }];
+}
+
+// Every notice kept for the reference, matched exactly, newest received first, the later-inserted first in one instant.
+// Answers the JSON list as text, built from the stored bodies themselves, so each comes back whole as it was sent.
+export function readStatus(db, url) {
+  const item = url.searchParams.get('item');
+  if (!item) throw new HttpError(400, "item is required: the item's reference");
+  const rows = db.prepare('SELECT body FROM notices WHERE item = ? ORDER BY received DESC, rowid DESC').all(item);
+  return [200, `[${rows.map((row) => row.body).join(',')}]`];
+}
