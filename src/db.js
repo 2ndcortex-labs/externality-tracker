@@ -16,6 +16,8 @@ export function openDb(env) {
     who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
     cleared_date TEXT, cleared_words TEXT)`);
   db.exec('CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, scope TEXT, url TEXT, date TEXT, last_delivery_date TEXT, last_delivery_status INTEGER)');
+  // One row per notice taken at the open notice address, never replaced; `body` is the post's text as received.
+  db.exec('CREATE TABLE IF NOT EXISTS notices (id TEXT PRIMARY KEY, item TEXT, state TEXT, what TEXT, body TEXT, received TEXT)');
   migrate(db);
   return db;
 }

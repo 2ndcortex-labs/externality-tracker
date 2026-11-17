@@ -17,6 +17,7 @@ The server binds `0.0.0.0` on `PORT` (default 3000). It refuses to start when `O
 
 - `ORG_SLUG` — the one org this instance serves.
 - `EXTERNALITY_KEY` — the static key for that org.
+- `ADDRESS_KEY` — optional; the hard-to-guess part of the two open addresses (see "Open addresses").
 
 ## Volume
 
@@ -53,3 +54,41 @@ JSON in and out. Errors are `{"error": "<reason>"}`: 400 for a bad body or a mis
 After an add answers 201, the record is POSTed once as JSON (`content-type: application/json`, the same record inventory returns, no auth header) to the URL of every token whose scope covers its atlas; a token without a URL receives nothing, and updates are not re-sent. No retry: one attempt per token per add, each under a timeout of 10 seconds by default, `DELIVERY_TIMEOUT_MS` (a positive integer of milliseconds) the override. The outcome is stored on the token, the latest only: `last-delivery-date`, the instant the attempt started, and `last-delivery-status`, the HTTP status, 0 when no response came; `GET /token` reads it.
 
 A record has exactly these fields: `id`, `org-slug`, `atlas-slug`, `item-slug`, `what`, `who-acts`, `how-observed`, `state`, `set-date`, `cleared-date`, `cleared-words`. Dates are ISO 8601 UTC; the last two are `null` while the record is open.
+
+## Open addresses
+
+Two addresses take a road plans notice as it is sent and answer a status read by an item's reference, in the terms of Roadwork's constitution ("Externalities and their notices"):
+
+- `POST /<part>/notify` — the notice address, Roadwork's `notify-url`.
+- `GET /<part>/status?item=<reference>` — the status address, Roadwork's `status-url`.
+
+`<part>` is the value of `ADDRESS_KEY`. The owner chooses it and hands the two addresses to the project; there is one part per running service, and setting a new one and restarting changes both addresses together. `ADDRESS_KEY` unset or empty: the service starts as before and neither address exists. Set, it must be letters, digits, `-` and `_` only, 32 characters or more (a UUID or a 32-byte base64url value both qualify); any other value refuses the start, as an empty `ORG_SLUG` does.
+
+**The part is the only guard on these two addresses.** Neither checks a key or a token, and one sent with a call is ignored: anyone who has an address can post notices to it and read every notice through it. A wrong part, a part while `ADDRESS_KEY` is unset, or another method at the right part answers exactly as an unknown route: 404 `{"error": "not found"}`.
+
+### The notice
+
+A post is taken when it passes this test, and only then:
+
+- the body is a JSON record of named fields;
+- its `item` is a text that is not empty once trimmed — the item's reference, `<kind>/<item-name>`;
+- its `state` is exactly `open` or `cleared`, in lower case;
+- its `what` is a text that is not empty once trimmed.
+
+Nothing else is checked, and every field is kept as sent, the nine fields of Roadwork's notice and any others. Each notice is kept as an entry of its own; an opened and a cleared notice for one externality are two entries, and none replaces another. A kept notice answers 201 `{"id": "<id>"}`; the id is given there and nowhere else. The 1 MB body limit applies (400 `body too large`). A notice taken here is not delivered to any token's URL, and is not a record of `POST /add`: it is never listed by `GET /inventory` or `GET /status`.
+
+A refused post answers 400 `{"error": "<message>"}`, one message naming each failed part, joined by `; ` in the order item, state, what:
+
+- `the body must be a JSON record of named fields` — a blank body, or one that is not JSON.
+- `the body must be a JSON record of named fields; got a list` — and likewise `; got a text`, `; got a number`, `; got a boolean`, `; got null`.
+- `item must be a non-empty text, the item's reference`
+- `state must be open or cleared; got <value>` — the value as sent where it is a text, `nothing` where the field is absent, its JSON form otherwise.
+- `what must be a non-empty text`
+
+For example, a record with no `item` and a `state` of `done` answers `item must be a non-empty text, the item's reference; state must be open or cleared; got done`.
+
+### The status read
+
+`item`, URL-decoded, is matched to the `item` of each kept notice exactly, case and spaces included. The answer is 200 with a JSON list of the notices for that reference, each whole as it was sent, newest received first (notices received in the same instant: the later one first). A reference with no notice answers 200 `[]`. Several entries may carry one externality's `what`; the newest tells its state. A missing or empty `item` answers 400 `{"error": "item is required: the item's reference"}`.
+
+Records added by `POST /add` stay where they are, listed by the routes that list them today; the status read never lists them.
