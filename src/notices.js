@@ -45,12 +45,13 @@ export function test(text) {
 }
 
 // Keeps the notice as its own row, the body's text as received; answers its id and nothing else.
+// The parsed record follows the answer, for the caller's passing-on; it is never sent back.
 export function keep(db, text) {
   const body = test(text);
   const id = randomUUID();
   db.prepare('INSERT INTO notices (id, item, state, what, body, received) VALUES (?, ?, ?, ?, ?, ?)')
     .run(id, body.item, body.state, body.what, text, new Date().toISOString());
-  return [201, { id }];
+  return [201, { id }, body];
 }
 
 // Every notice kept for the reference, matched exactly, newest received first, the later-inserted first in one instant.

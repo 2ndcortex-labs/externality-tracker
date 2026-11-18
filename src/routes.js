@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { toWire, toTokenWire } from './db.js';
+import { toWire, toTokenWire, toThirdpartyWire } from './db.js';
 import { HttpError, parseScope } from './auth.js';
 
 export { HttpError };
@@ -29,7 +29,7 @@ function isObject(body) {
   return body !== null && typeof body === 'object' && !Array.isArray(body);
 }
 
-function isHttpUrl(v) {
+export function isHttpUrl(v) {
   if (typeof v !== 'string') return false;
   try {
     const { protocol } = new URL(v);
@@ -150,4 +150,9 @@ export function inventory(db, call, url) {
 // The calling token's own record, read by its own credential.
 export function tokenInfo(call) {
   return [200, toTokenWire(call.tokenRow)];
+}
+
+// The owner's read of the latest third-party outcome, under the org key.
+export function thirdpartyInfo(db) {
+  return [200, toThirdpartyWire(db.prepare('SELECT * FROM thirdparty WHERE id = 1').get())];
 }

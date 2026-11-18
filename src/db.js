@@ -18,6 +18,8 @@ export function openDb(env) {
   db.exec('CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, scope TEXT, url TEXT, date TEXT, last_delivery_date TEXT, last_delivery_status INTEGER)');
   // One row per notice taken at the open notice address, never replaced; `body` is the post's text as received.
   db.exec('CREATE TABLE IF NOT EXISTS notices (id TEXT PRIMARY KEY, item TEXT, state TEXT, what TEXT, body TEXT, received TEXT)');
+  // The latest third-party outcome, one row for the whole service (id 1), absent until an attempt has settled.
+  db.exec('CREATE TABLE IF NOT EXISTS thirdparty (id INTEGER PRIMARY KEY CHECK (id = 1), last_delivery_date TEXT, last_delivery_status INTEGER)');
   migrate(db);
   return db;
 }
@@ -55,5 +57,24 @@ export function toTokenWire(row) {
     'date': row.date,
     'last-delivery-date': row.last_delivery_date ?? null,
     'last-delivery-status': row.last_delivery_status ?? null,
+  };
+}
+
+// Writes the third-party outcome over the last one. A database closed before the attempt settled loses it, nothing else.
+export function saveThirdparty(db, date, status) {
+  try {
+    db.prepare(`INSERT INTO thirdparty (id, last_delivery_date, last_delivery_status) VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET last_delivery_date = excluded.last_delivery_date, last_delivery_status = excluded.last_delivery_status`)
+      .run(date, status);
+  } catch {
+    // the outcome is lost; the notice is unaffected
+  }
+}
+
+// The third-party outcome on the wire: both fields null until an attempt has settled.
+export function toThirdpartyWire(row) {
+  return {
+    'last-delivery-date': row?.last_delivery_date ?? null,
+    'last-delivery-status': row?.last_delivery_status ?? null,
   };
 }

@@ -3,9 +3,10 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { loadAuthConfig, loadAddressKey, matchesPart, resolveCall, refuse, authenticateToken, parseScope } from './auth.js';
 import { openDb } from './db.js';
-import { HttpError, add, mint, update, status, inventory, tokenInfo } from './routes.js';
+import { HttpError, add, mint, update, status, inventory, tokenInfo, thirdpartyInfo } from './routes.js';
 import { keep, readStatus } from './notices.js';
-import { deliver } from './deliver.js';
+import { deliver, timeoutMs } from './deliver.js';
+import { PASSED_ON, parseAllow, passOn } from './thirdparty.js';
 
 const STARTED = new Date(performance.timeOrigin).toISOString();
 const MAX_BODY = 1024 * 1024;
@@ -20,6 +21,7 @@ const ROUTES = {
   'GET /status': { credential: 'token', handler: (db, call, url) => status(db, call, url) },
   'GET /inventory': { credential: 'token', handler: (db, call, url) => inventory(db, call, url) },
   'GET /token': { credential: 'token', handler: (db, call) => tokenInfo(call) },
+  'GET /thirdparty': { credential: 'key', handler: (db) => thirdpartyInfo(db) },
 };
 
 function send(res, code, payload) {
@@ -55,6 +57,7 @@ async function readJson(req) {
 export function createServer(env = process.env) {
   const config = loadAuthConfig(env);
   const part = loadAddressKey(env);
+  const allow = parseAllow(env.THIRDPARTY_ALLOW ?? '');
   const db = openDb(env);
   const server = http.createServer(async (req, res) => {
     try {
@@ -66,7 +69,16 @@ export function createServer(env = process.env) {
       // to the route table, which answers 404 as for any unknown route.
       const open = ADDRESS.exec(url.pathname);
       if (open && matchesPart(open[1], part)) {
-        if (req.method === 'POST' && open[2] === 'notify') return send(res, ...keep(db, await readText(req)));
+        if (req.method === 'POST' && open[2] === 'notify') {
+          const text = await readText(req);
+          const [code, payload, record] = keep(db, text);
+          send(res, code, payload);
+          // A notice that is itself a passing-on (it carries PASSED_ON, any value) is kept but never passed on again.
+          if (Object.hasOwn(req.headers, PASSED_ON)) return;
+          // The notice is kept and answered; its passing-on to a third party starts now and is never awaited.
+          void passOn(db, record, text, { allow, timeout: timeoutMs(env) });
+          return;
+        }
         if (req.method === 'GET' && open[2] === 'status') return sendText(res, ...readStatus(db, url));
       }
       const name = `${req.method} ${url.pathname}`;
