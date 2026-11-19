@@ -505,6 +505,21 @@ test('the limit: a count ends one window after its first ask, per caller and for
   assert.equal(may('a'), true, 'a window ends one window after its first ask');
 });
 
+test('the limit: posts over the service-wide number, from many callers, add no caller window; ended windows are swept', () => {
+  let t = 0;
+  const may = makeLimiter({ perCaller: 5, total: 3, windowMs: 1000 }, () => t);
+  for (const caller of ['a', 'b', 'c']) assert.equal(may(caller), true);
+  assert.equal(may.callers(), 3);
+  for (let i = 0; i < 500; i++) assert.equal(may(`198.51.100.${i}`), false, 'over the service-wide number');
+  assert.equal(may.callers(), 3, 'no window made or kept for a refused caller');
+  t = 999;
+  assert.equal(may('d'), false, 'every post counted toward the service, the refused ones included');
+  assert.equal(may.callers(), 3);
+  t = 1000;
+  assert.equal(may('e'), true, 'a new window for the service');
+  assert.equal(may.callers(), 1, "the ended callers' windows are swept");
+});
+
 // Asking for a token, in the service's own tests against a local service.
 
 test('A1: an authorized address gets 201 and a token; a second ask gets 200 and the same token; no credential is sent', async () => {
@@ -2061,6 +2076,63 @@ test('A27: a database made by the old code opens under the new code with its rec
     assert.deepEqual((await request(s.base, 'GET', '/thirdparty', { headers: bearer(token) })).json,
       { 'last-delivery-date': '2026-11-01T00:00:00.000Z', 'last-delivery-status': 204 });
     assert.deepEqual((await request(s.base, 'GET', '/inventory', { headers: bearer(token) })).json, { records: [] });
+  } finally {
+    await s.close();
+  }
+});
+
+test('the old shape without a tokens table: records and notices dropped once, the third-party outcome kept, records made after kept', async () => {
+  const dir = mkdtempSync(join(dataDir, 'old-'));
+  const old = new DatabaseSync(join(dir, 'externalities.sqlite'));
+  try {
+    old.exec(`CREATE TABLE externalities (
+      id TEXT PRIMARY KEY, org TEXT, atlas TEXT, item TEXT, what TEXT,
+      who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
+      cleared_date TEXT, cleared_words TEXT)`);
+    old.exec('CREATE TABLE notices (id TEXT PRIMARY KEY, item TEXT, state TEXT, what TEXT, body TEXT, received TEXT)');
+    old.exec('CREATE TABLE thirdparty (id INTEGER PRIMARY KEY CHECK (id = 1), last_delivery_date TEXT, last_delivery_status INTEGER)');
+    old.prepare(`INSERT INTO externalities (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('old-2', ORG, 'old-atlas', 'old-item', 'kept before', 'someone', 'somehow', 'open',
+      '2026-10-12T00:00:00.000Z', null, null);
+    old.prepare('INSERT INTO notices (id, item, state, what, body, received) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('old-n2', 'feature/old', 'open', 'w', '{"item":"feature/old","state":"open","what":"w"}', '2026-10-12T00:00:00.000Z');
+    old.prepare('INSERT INTO thirdparty (id, last_delivery_date, last_delivery_status) VALUES (1, ?, ?)').run('2026-11-02T00:00:00.000Z', 202);
+  } finally {
+    old.close();
+  }
+  let s = await startOn(dir);
+  let token;
+  let id;
+  try {
+    assert.deepEqual(s.lines, [DROPPED], 'the one line, once');
+    const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
+    try {
+      for (const table of ['externalities', 'notices', 'tokens']) {
+        assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 0, `${table} is empty`);
+      }
+      for (const table of ['externalities', 'notices']) {
+        assert.ok(db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === 'token_id'), `${table} made new`);
+      }
+      assert.equal(db.prepare('SELECT last_delivery_status AS s FROM thirdparty').get().s, 202, 'the third-party outcome is kept');
+    } finally {
+      db.close();
+    }
+    await listEmail(s.base, HOLDER);
+    token = (await tokenAt(s.base, HOLDER)).token;
+    const r = await request(s.base, 'POST', '/add', { headers: byToken(token, 'between', 'between-item'), body: BODY });
+    assert.equal(r.status, 201, r.json && r.json.error);
+    id = r.json.id;
+  } finally {
+    await s.close();
+  }
+  s = await startOn(dir);
+  try {
+    assert.deepEqual(s.lines, [], 'a second open drops nothing');
+    const inv = await request(s.base, 'GET', '/inventory', { headers: byToken(token) });
+    assert.equal(inv.status, 200);
+    assert.deepEqual(idsOf(inv.json.records), [id], 'the record made in between is kept');
+    assert.deepEqual((await request(s.base, 'GET', '/thirdparty', { headers: bearer(token) })).json,
+      { 'last-delivery-date': '2026-11-02T00:00:00.000Z', 'last-delivery-status': 202 });
   } finally {
     await s.close();
   }

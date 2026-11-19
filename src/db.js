@@ -28,15 +28,26 @@ const TABLES = [
 
 export const DROPPED_LINE = 'externality-tracker: dropped old tables externalities, notices, tokens';
 
-// A database made before tokens belonged to emails is known by the `scope` column of its `tokens` table: its records,
-// notices and tokens are dropped and the tables made new, in one transaction, `thirdparty` left as it is. A database
-// without that column drops nothing, so no later start deletes anything.
+const TOKEN_COLUMNS = ['id', 'email', 'token', 'authorized_email', 'url', 'date', 'last_delivery_date', 'last_delivery_status'];
+
+// A database made before tokens belonged to emails is known by its tables: `externalities` or `notices` present without
+// `token_id`, or `tokens` present without every new column (today's old one has `scope` and no `authorized_email`).
+// Its records, notices and tokens are dropped and the tables made new, in one transaction, `thirdparty` left as it is.
+// A database in the new shape drops nothing, so no later start deletes anything.
+function isOld(db) {
+  const lacks = (table, wanted) => {
+    const have = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    return have.length > 0 && !wanted.every((c) => have.includes(c));
+  };
+  return lacks('externalities', ['token_id']) || lacks('notices', ['token_id']) || lacks('tokens', TOKEN_COLUMNS);
+}
+
 export function openDb(env) {
   const dir = dataDir(env);
   mkdirSync(dir, { recursive: true });
   const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
   db.exec('PRAGMA journal_mode = WAL');
-  const old = db.prepare('PRAGMA table_info(tokens)').all().some((c) => c.name === 'scope');
+  const old = isOld(db);
   db.exec('BEGIN');
   try {
     if (old) db.exec('DROP TABLE IF EXISTS externalities; DROP TABLE IF EXISTS notices; DROP TABLE IF EXISTS tokens;');

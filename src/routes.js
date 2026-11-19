@@ -42,30 +42,37 @@ export function isHttpUrl(v) {
 }
 
 // The limit on asking: a fixed window in memory per key, a count starting at the key's first ask and ending `windowMs`
-// later; lost at a restart. Each post counts toward its caller's key and the service's, whatever its answer.
+// later; lost at a restart. Every post counts toward the service's window, whatever its answer. A post the service's
+// count already refuses touches no caller's window, so callers' windows are made only by posts within the service's
+// number, at most `total` of them per window; ended windows are swept at most once a window.
 export const LIMITS = { perCaller: 5, total: 60, windowMs: 60_000 };
 
 export function makeLimiter(limits = LIMITS, now = Date.now) {
   const { perCaller, total, windowMs } = { ...LIMITS, ...limits };
-  const windows = new Map();
-  const count = (key, t) => {
-    let w = windows.get(key);
+  const callers = new Map();
+  let service = { start: -Infinity, n: 0 };
+  let swept = -Infinity;
+  // True when the ask may proceed.
+  const may = (caller) => {
+    const t = now();
+    if (t - service.start >= windowMs) service = { start: t, n: 0 };
+    service.n += 1;
+    if (t - swept >= windowMs) {
+      swept = t;
+      for (const [key, w] of callers) if (t - w.start >= windowMs) callers.delete(key);
+    }
+    if (service.n > total) return false;
+    let w = callers.get(caller);
     if (!w || t - w.start >= windowMs) {
       w = { start: t, n: 0 };
-      windows.set(key, w);
+      callers.set(caller, w);
     }
     w.n += 1;
-    return w.n;
+    return w.n <= perCaller;
   };
-  // True when the ask may proceed.
-  return (caller) => {
-    const t = now();
-    // Ended windows are swept once the map grows, so callers that have gone do not pile up.
-    if (windows.size > 10_000) for (const [key, w] of windows) if (t - w.start >= windowMs) windows.delete(key);
-    const mine = count(`caller ${caller}`, t);
-    const all = count('service', t);
-    return mine <= perCaller && all <= total;
-  };
+  // The number of callers' windows held, for the tests.
+  may.callers = () => callers.size;
+  return may;
 }
 
 // Addresses are trimmed and lowered before they are stored or matched.

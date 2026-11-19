@@ -27,7 +27,7 @@ No email address is ever a setting: the list of authorized emails lives in the d
 
 The database is `${DATA_DIR}/externalities.sqlite`. `DATA_DIR` is read from the `DATA_DIR` variable, else `RAILWAY_VOLUME_MOUNT_PATH`, else `./data` (made if missing). On Railway, mount a volume (for example at `/data`) and set `DATA_DIR=/data` so records survive a redeploy.
 
-The first start on a database made before tokens belonged to email addresses (known by its old `tokens` table) drops the tables `externalities`, `notices` and `tokens` in one transaction, makes them new and empty, leaves the third-party outcome as it is, and writes one line to the log: `externality-tracker: dropped old tables externalities, notices, tokens`. No later start drops anything.
+The first start on a database made before tokens belonged to email addresses (known by an `externalities` or `notices` table without `token_id`, or a `tokens` table without the new columns) drops the tables `externalities`, `notices` and `tokens` in one transaction, makes them new and empty, leaves the third-party outcome as it is, and writes one line to the log: `externality-tracker: dropped old tables externalities, notices, tokens`. No later start drops anything.
 
 ## Call values
 
@@ -58,7 +58,7 @@ Deactivating an authorized email refuses its token, its asks and those of all it
 
 **The forwarding URL.** An ask may name a forwarding URL, `url`, stored with that address's token. A later ask naming another URL replaces it, an ask naming none leaves it, and an ask naming `null` clears it; the token does not change. After a record is added, it is posted to the forwarding URL of the token that made it, and to no other (see "Endpoints").
 
-**The limit on asking.** One caller gets 5 posts to `POST /tokens` a minute and the whole service 60; a further post answers 429 `{"error": "too many asks"}`. Every post counts toward both, whatever its answer. The caller is the header `X-Real-IP`, else the connection's own address. A count starts at a key's first post and ends one minute later; counts live in memory and are lost at a restart.
+**The limit on asking.** One caller gets 5 posts to `POST /tokens` a minute and the whole service 60; a further post answers 429 `{"error": "too many asks"}`. Every post counts toward the service's count, whatever its answer, and toward its caller's unless the service's count already refuses it. The caller is the header `X-Real-IP`, else the connection's own address. A count starts at a key's first post and ends one minute later; counts live in memory and are lost at a restart.
 
 ## Endpoints
 
