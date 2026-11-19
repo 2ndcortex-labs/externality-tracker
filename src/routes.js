@@ -108,10 +108,13 @@ export function setActive(db, body) {
   return [200, { email, active: body.active }];
 }
 
-// An ask for a token, under no credential. The asked address's authorized form (the text from its first `+` to its `@`
-// removed) is compared with every authorized email, active or not, in constant time; the address itself, a variation
-// or the authorized form, holds one token, made at its first ask. `url` absent leaves the stored one, null clears it.
-export function ask(db, body) {
+// An ask for a token. The asked address's authorized form (the text from its first `+` to its `@` removed) is compared
+// with every authorized email, active or not, in constant time; the address itself, a variation or the authorized form,
+// holds one token. A first ask reads no credential and makes the token. A later ask (the address already has a token)
+// must carry that token as `bearer`, compared in constant time; none or any other value gets the unknown address's 401
+// and writes nothing. A match writes a new token and date, and the URL when named, on the same row in one write, which
+// holds only while the row still carries the matched token. `url` absent leaves the stored one, null clears it.
+export function ask(db, body, bearer = null) {
   if (!isObject(body)) throw new HttpError(400, 'body must be a JSON object');
   if (!isText(body.email)) throw new HttpError(400, 'email must be a non-empty string');
   const hasUrl = Object.hasOwn(body, 'url');
@@ -130,11 +133,14 @@ export function ask(db, body) {
       .run(email, row.token, found.id, row.url, row.date);
     return [201, row];
   }
-  if (hasUrl) {
-    db.prepare('UPDATE tokens SET url = ? WHERE id = ?').run(body.url, own.id);
-    own.url = body.url;
-  }
-  return [200, { token: own.token, url: own.url ?? null, date: own.date }];
+  if (typeof bearer !== 'string' || !safeEqual(bearer, own.token)) throw new HttpError(401, 'refused');
+  const row = { token: randomBytes(32).toString('base64url'), url: hasUrl ? body.url : own.url ?? null, date: new Date().toISOString() };
+  const r = hasUrl
+    ? db.prepare('UPDATE tokens SET token = ?, date = ?, url = ? WHERE id = ? AND token = ?').run(row.token, row.date, row.url, own.id, own.token)
+    : db.prepare('UPDATE tokens SET token = ?, date = ? WHERE id = ? AND token = ?').run(row.token, row.date, own.id, own.token);
+  // Another ask renewed the row first: the matched token is no longer current.
+  if (r.changes !== 1) throw new HttpError(401, 'refused');
+  return [200, row];
 }
 
 export function add(db, call, body) {

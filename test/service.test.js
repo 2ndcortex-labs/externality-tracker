@@ -12,6 +12,7 @@ import { createServer } from '../src/server.js';
 import { timeoutMs } from '../src/deliver.js';
 import { loadAddressKey, loadAdminToken } from '../src/auth.js';
 import { LIMITS, makeLimiter } from '../src/routes.js';
+import { openDb } from '../src/db.js';
 import { networkInterfaces } from 'node:os';
 import { parseAllow, resolveTarget, postOnce, refusedList } from '../src/thirdparty.js';
 
@@ -522,7 +523,7 @@ test('the limit: posts over the service-wide number, from many callers, add no c
 
 // Asking for a token, in the service's own tests against a local service.
 
-test('A1: an authorized address gets 201 and a token; a second ask gets 200 and the same token; no credential is sent', async () => {
+test('A1: an authorized address gets 201 and a token, no credential sent; a second ask bearing that token gets 200 and a new token', async () => {
   await listEmail(base, 'first@example.org');
   const one = await call('POST', '/tokens', { body: { email: 'first@example.org' } });
   assert.equal(one.status, 201, one.json && one.json.error);
@@ -530,17 +531,17 @@ test('A1: an authorized address gets 201 and a token; a second ask gets 200 and 
   assert.ok(BASE64URL_32_BYTES.test(one.json.token), 'the token is 32 bytes as base64url');
   assert.equal(one.json.url, null);
   assert.match(one.json.date, ISO);
-  const two = await call('POST', '/tokens', { body: { email: 'first@example.org' } });
+  const two = await call('POST', '/tokens', { headers: bearer(one.json.token), body: { email: 'first@example.org' } });
   assert.equal(two.status, 200, two.json && two.json.error);
   assert.deepEqual(Object.keys(two.json), ['token', 'url', 'date']);
-  assert.ok(two.json.token === one.json.token, 'the same token');
-  assert.equal(two.json.date, one.json.date);
-  assert.equal((await call('GET', '/token', { headers: bearer(one.json.token) })).status, 200, 'the token opens a token route');
+  assert.ok(two.json.token !== one.json.token, 'a new token');
+  assert.match(two.json.date, ISO);
+  assert.equal((await call('GET', '/token', { headers: bearer(two.json.token) })).status, 200, 'the new token opens a token route');
   const db = openMain();
   try {
     const rows = db.prepare('SELECT email, token FROM tokens WHERE email = ?').all('first@example.org');
     assert.equal(rows.length, 1, 'one token, stored next to its address');
-    assert.ok(rows[0].token === one.json.token, 'the stored token is the one returned');
+    assert.ok(rows[0].token === two.json.token, 'the stored token is the one last returned');
   } finally {
     db.close();
   }
@@ -559,17 +560,17 @@ test('A3: an address asked in capitals, with spaces around it, gets its token', 
   await listEmail(base, 'caps@example.org');
   const first = await askAt(base, '  CAPS@Example.ORG \t');
   assert.equal(first.status, 201, first.json && first.json.error);
-  const plain = await askAt(base, 'caps@example.org');
-  assert.equal(plain.status, 200);
-  assert.ok(plain.json.token === first.json.token, 'the same token as the plain address');
+  const plain = await askAt(base, 'caps@example.org', {}, bearer(first.json.token));
+  assert.equal(plain.status, 200, 'the token asked in capitals is the plain address\'s');
+  assert.ok(plain.json.token !== first.json.token, 'renewed');
   const loud = await askAt(base, ' Caps+Work@EXAMPLE.org ');
   assert.equal(loud.status, 201, loud.json && loud.json.error);
-  const quiet = await askAt(base, 'caps+work@example.org');
-  assert.equal(quiet.status, 200);
-  assert.ok(quiet.json.token === loud.json.token, 'a variation in capitals is the same variation');
+  const quiet = await askAt(base, 'caps+work@example.org', {}, bearer(loud.json.token));
+  assert.equal(quiet.status, 200, 'a variation in capitals is the same variation');
+  assert.ok(quiet.json.token !== loud.json.token, 'renewed');
 });
 
-test('A4: an ask naming a URL stores it, another replaces it, a bare ask keeps it, null clears it; the token never changes', async () => {
+test('A4: an ask naming a URL stores it, another replaces it, a bare ask keeps it, null clears it; each later ask bears the current token', async () => {
   const email = 'forward@example.org';
   await listEmail(base, email);
   const u1 = 'http://127.0.0.1:1/hook?x=1&y=two';
@@ -578,7 +579,7 @@ test('A4: an ask naming a URL stores it, another replaces it, a bare ask keeps i
   let r = await askAt(base, email, { url: u1 });
   assert.equal(r.status, 201, r.json && r.json.error);
   assert.equal(r.json.url, u1);
-  const token = r.json.token;
+  let token = r.json.token;
   assert.equal(await urlOf(token), u1);
   for (const [label, extra, code, url] of [
     ['another URL', { url: u2 }, 200, u2],
@@ -586,10 +587,11 @@ test('A4: an ask naming a URL stores it, another replaces it, a bare ask keeps i
     ['null', { url: null }, 200, null],
     ['a bare ask after null', {}, 200, null],
   ]) {
-    r = await askAt(base, email, extra);
+    r = await askAt(base, email, extra, bearer(token));
     assert.equal(r.status, code, label);
     assert.equal(r.json.url, url, label);
-    assert.ok(r.json.token === token, `${label}: the token is unchanged`);
+    assert.ok(r.json.token !== token, `${label}: a new token`);
+    token = r.json.token;
     assert.equal(await urlOf(token), url, `${label}: as stored`);
   }
 });
@@ -632,7 +634,7 @@ test('A6: a variation of an authorized address, never added, gets 201 and a toke
   }
 });
 
-test("A7: a variation's token differs from its authorized address's and from a second variation's; each returns unchanged", async () => {
+test("A7: a variation's token differs from its authorized address's and from a second variation's; each renews its own", async () => {
   await listEmail(base, 'split@example.org');
   const emails = ['split@example.org', 'split+one@example.org', 'split+two@example.org'];
   const first = [];
@@ -643,9 +645,9 @@ test("A7: a variation's token differs from its authorized address's and from a s
   }
   assert.equal(new Set(first).size, 3, 'three different tokens');
   for (const [i, email] of emails.entries()) {
-    const r = await askAt(base, email);
+    const r = await askAt(base, email, {}, bearer(first[i]));
     assert.equal(r.status, 200, email);
-    assert.ok(r.json.token === first[i], `${email}: unchanged`);
+    assert.ok(r.json.token !== first[i], `${email}: renewed`);
   }
 });
 
@@ -675,19 +677,22 @@ test('A9: the sixth post from one caller within a minute gets 429, whatever the 
     await listEmail(s.base, 'limit@example.org');
     const from = { 'X-Real-IP': '203.0.113.9' };
     const answers = [];
-    for (const opts of [
+    let current; // the address's then-current token: a later ask bears it
+    for (const { renew, ...opts } of [
       { body: { email: 'limit@example.org' } },
       { body: { email: 'nobody@example.org' } },
       { body: {} },
-      { body: { email: 'limit@example.org' } },
+      { body: { email: 'limit@example.org' }, renew: true },
       { raw: '{not json' },
     ]) {
-      answers.push((await request(s.base, 'POST', '/tokens', { headers: from, ...opts })).status);
+      const r = await request(s.base, 'POST', '/tokens', { headers: renew ? { ...from, ...bearer(current) } : from, ...opts });
+      if (r.json && r.json.token) current = r.json.token;
+      answers.push(r.status);
     }
     assert.deepEqual(answers, [201, 401, 400, 200, 400]);
     const sixth = await request(s.base, 'POST', '/tokens', { headers: from, body: { email: 'limit@example.org' } });
     assert.deepEqual(sixth, { status: 429, json: { error: 'too many asks' } });
-    const another = await request(s.base, 'POST', '/tokens', { headers: { 'X-Real-IP': '203.0.113.10' }, body: { email: 'limit@example.org' } });
+    const another = await request(s.base, 'POST', '/tokens', { headers: { 'X-Real-IP': '203.0.113.10', ...bearer(current) }, body: { email: 'limit@example.org' } });
     assert.equal(another.status, 200, "another caller is not held by this one's count");
     // Without X-Real-IP the connection's own address is the caller.
     for (let i = 0; i < 5; i++) {
@@ -778,9 +783,9 @@ test("A13: deactivating an address refuses its token, its asks and its variation
     const inv = await call('GET', '/inventory', { headers: byToken(token) });
     assert.equal(inv.status, 200, email);
     assert.deepEqual(idsOf(inv.json.records), [ids[i]], `${email}: its record is back`);
-    const again = await askAt(base, email);
-    assert.equal(again.status, 200, email);
-    assert.ok(again.json.token === token, `${email}: the same token`);
+    const again = await askAt(base, email, {}, bearer(token));
+    assert.equal(again.status, 200, `${email}: the same token asks again`);
+    assert.ok(again.json.token !== token, `${email}: renewed`);
   }
 });
 
@@ -1994,10 +1999,11 @@ test('A26: POST /tokens ignores a scope; GET /token returns none', async () => {
   const r = await askAt(base, email, { scope: 'some-atlas' });
   assert.equal(r.status, 201, r.json && r.json.error);
   assert.deepEqual(Object.keys(r.json), ['token', 'url', 'date']);
-  const again = await askAt(base, email, { scope: 'all' });
+  const again = await askAt(base, email, { scope: 'all' }, bearer(r.json.token));
   assert.equal(again.status, 200);
-  assert.ok(again.json.token === r.json.token, 'the same token, whatever scope is sent');
-  const info = await call('GET', '/token', { headers: bearer(r.json.token) });
+  assert.deepEqual(Object.keys(again.json), ['token', 'url', 'date'], 'no scope, whatever scope is sent');
+  const token = again.json.token;
+  const info = await call('GET', '/token', { headers: bearer(token) });
   assert.deepEqual(Object.keys(info.json).sort(), TOKEN_FIELDS);
   assert.equal('scope' in info.json, false);
   const db = openMain();
@@ -2006,8 +2012,8 @@ test('A26: POST /tokens ignores a scope; GET /token returns none', async () => {
   } finally {
     db.close();
   }
-  const added = await addFull('an-atlas-not-named', 'a26-item', r.json.token);
-  const inv = await call('GET', '/inventory', { headers: byToken(r.json.token) });
+  const added = await addFull('an-atlas-not-named', 'a26-item', token);
+  const inv = await call('GET', '/inventory', { headers: byToken(token) });
   assert.deepEqual(idsOf(inv.json.records), [added.id], 'records are the token\'s, under any atlas');
 });
 
@@ -2162,6 +2168,351 @@ test('A28: records made after that survive a restart', async () => {
     assert.deepEqual(idsOf(inv.json.records), [id], 'the record survives the restart');
     const st = await request(s.base, 'GET', '/status', { headers: byToken(token, 'after', 'after-item'), params: { id } });
     assert.equal(st.json.record.what, BODY.what);
+  } finally {
+    await s.close();
+  }
+});
+
+// A later ask (the address already has a token) bears that token and gets a new one. No assertion message carries a token.
+
+test('re-call A1: a later ask with no bearer token answers 401 refused, the body equal to an unknown address\'s', async () => {
+  const email = 'recall-a1@example.org';
+  await listEmail(base, email);
+  const t = (await tokenAt(base, email)).token;
+  const unknown = await askAt(base, 'recall-a1-never@example.org');
+  assert.deepEqual(unknown, REFUSED, 'an unknown address');
+  for (const [label, opts] of [
+    ['no header', {}],
+    ['an empty bearer', { headers: { 'Authorization': 'Bearer ' } }],
+    ['another scheme', { headers: { 'Authorization': `Basic ${t}` } }],
+    ['the old header', { headers: { 'X-Consumer-Token': t } }],
+    ['a URL parameter', { params: { token: t } }],
+  ]) {
+    const r = await request(base, 'POST', '/tokens', { ...opts, body: { email } });
+    assert.deepEqual(r, unknown, label);
+  }
+});
+
+test('re-call A2: a later ask with another address\'s token, a variation\'s, the admin token or the old token answers the same refusal', async () => {
+  const email = 'recall-a2@example.org';
+  await listEmail(base, email);
+  await listEmail(base, 'recall-a2-other@example.org');
+  const old = (await tokenAt(base, email)).token;
+  const varied = (await tokenAt(base, 'recall-a2+v@example.org')).token;
+  const other = (await tokenAt(base, 'recall-a2-other@example.org')).token;
+  const renewed = await askAt(base, email, {}, bearer(old));
+  assert.equal(renewed.status, 200, renewed.json && renewed.json.error);
+  const current = renewed.json.token;
+  const unknown = await askAt(base, 'recall-a2-never@example.org', {}, bearer(current));
+  assert.deepEqual(unknown, REFUSED, 'an unknown address');
+  for (const [label, token] of [['another address\'s', other], ['a variation\'s', varied], ['the admin token', ADMIN],
+    ['the old token', old], ['a near token', `${current.slice(0, -1)}${current.endsWith('A') ? 'B' : 'A'}`]]) {
+    assert.deepEqual(await askAt(base, email, {}, bearer(token)), unknown, label);
+  }
+  assert.deepEqual(await askAt(base, 'recall-a2+v@example.org', {}, bearer(current)), unknown, 'the plain address\'s token for its variation');
+  assert.equal((await call('GET', '/token', { headers: bearer(current) })).status, 200, 'the current token still works');
+});
+
+test('re-call A3: after a refused later ask the token still opens its routes; its URL, record and notice stand', async () => {
+  const email = 'recall-a3@example.org';
+  const url = 'https://example.org/recall-a3';
+  await listEmail(partBase, email);
+  const t = (await tokenAt(partBase, email, { url })).token;
+  const added = await request(partBase, 'POST', '/add', { headers: byToken(t, 'rc3', 'rc3-item'), body: BODY });
+  assert.equal(added.status, 201, added.json && added.json.error);
+  const item = 'feature/recall-a3';
+  assert.equal((await at('POST', `/${PART}/notify`, { headers: bearer(t), body: notice(item, 'open') })).status, 201);
+  const rowOf = () => {
+    const db = new DatabaseSync(join(partDir, 'externalities.sqlite'));
+    try {
+      return { ...db.prepare('SELECT * FROM tokens WHERE email = ?').get(email) };
+    } finally {
+      db.close();
+    }
+  };
+  const before = rowOf();
+  for (const [label, extra, headers] of [
+    ['no token', {}, {}],
+    ['no token, a new URL', { url: 'https://example.org/elsewhere' }, {}],
+    ['a wrong token, null', { url: null }, bearer('made-up')],
+    ['the admin token, a new URL', { url: 'https://example.org/elsewhere' }, asAdmin],
+  ]) {
+    assert.deepEqual(await askAt(partBase, email, extra, headers), REFUSED, label);
+  }
+  assert.deepEqual(rowOf(), before, 'the row is unchanged: token, URL, date');
+  const info = await request(partBase, 'GET', '/token', { headers: bearer(t) });
+  assert.equal(info.status, 200, 'the token still opens its routes');
+  assert.equal(info.json.url, url, 'the URL stands');
+  const inv = await request(partBase, 'GET', '/inventory', { headers: bearer(t) });
+  assert.deepEqual(idsOf(inv.json.records), [added.json.id], 'the record stands');
+  const st = await at('GET', statusPath(item), { headers: bearer(t) });
+  assert.deepEqual(st, { status: 200, json: [notice(item, 'open')] }, 'the notice stands');
+});
+
+test('re-call A4: a later ask with the current token answers 200 with three fields, a different token and that token\'s date', async () => {
+  const email = 'recall-a4@example.org';
+  await listEmail(base, email);
+  const first = await tokenAt(base, email);
+  await sleep(5); // the two dates cannot fall in one millisecond
+  const t0 = new Date().toISOString();
+  const r = await askAt(base, email, {}, bearer(first.token));
+  assert.equal(r.status, 200, r.json && r.json.error);
+  assert.deepEqual(Object.keys(r.json), ['token', 'url', 'date']);
+  assert.ok(r.json.token !== first.token, 'a different token');
+  assert.ok(BASE64URL_32_BYTES.test(r.json.token), 'the new token is 32 bytes as base64url');
+  assert.match(r.json.date, ISO);
+  assert.ok(r.json.date >= t0, 'dated when the new token was made');
+  assert.notEqual(r.json.date, first.date, 'a new date');
+  assert.equal(r.json.url, null);
+  assert.equal((await call('GET', '/token', { headers: bearer(r.json.token) })).json.date, r.json.date, 'the date stored with the new token');
+  const db = openMain();
+  try {
+    const row = db.prepare('SELECT token, date FROM tokens WHERE email = ?').get(email);
+    assert.ok(row.token === r.json.token, 'the stored token is the new one');
+    assert.equal(row.date, r.json.date);
+  } finally {
+    db.close();
+  }
+});
+
+test('re-call A5: the old token then answers 401 on every token route and at the notice and status addresses; the new one is accepted', async () => {
+  const email = 'recall-a5@example.org';
+  await listEmail(partBase, email);
+  const old = (await tokenAt(partBase, email)).token;
+  const r = await askAt(partBase, email, {}, bearer(old));
+  assert.equal(r.status, 200, r.json && r.json.error);
+  const fresh = r.json.token;
+  assert.ok(fresh !== old, 'a new token');
+  for (const [method, path, { slugs, ...opts }] of TOKEN_ROUTES('rc5', 'rc5-item')) {
+    const refused = await request(partBase, method, path, { ...opts, headers: { ...bearer(old), ...slugs } });
+    assert.deepEqual(refused, { status: 401, json: { error: 'unknown token' } }, `${method} ${path}: the old token`);
+    const accepted = await request(partBase, method, path, { ...opts, headers: { ...bearer(fresh), ...slugs } });
+    assert.notEqual(accepted.status, 401, `${method} ${path}: the new token`);
+  }
+  const item = 'feature/recall-a5';
+  for (const [method, path, opts] of [['POST', `/${PART}/notify`, { body: notice(item, 'open') }], ['GET', statusPath(item)]]) {
+    assert.deepEqual(await at(method, path, { ...opts, headers: bearer(old) }), { status: 401, json: { error: 'unknown token' } }, `${method} at an open address: the old token`);
+  }
+  assert.equal((await at('POST', `/${PART}/notify`, { headers: bearer(fresh), body: notice(item, 'open') })).status, 201, 'notify: the new token');
+  assert.deepEqual(await at('GET', statusPath(item), { headers: bearer(fresh) }), { status: 200, json: [notice(item, 'open')] }, 'status: the new token');
+});
+
+test('re-call A6: a record and a notice made with the old token are read with the new; so are the URL and the delivery outcome', async () => {
+  const email = 'recall-a6@example.org';
+  await listEmail(partBase, email);
+  const rx = await receiver();
+  const old = (await tokenAt(partBase, email, { url: rx.url })).token;
+  const added = await request(partBase, 'POST', '/add', { headers: byToken(old, 'rc6', 'rc6-item'), body: BODY });
+  assert.equal(added.status, 201, added.json && added.json.error);
+  let outcome;
+  for (let i = 0; i < 60; i++) {
+    outcome = (await request(partBase, 'GET', '/token', { headers: bearer(old) })).json;
+    if (outcome['last-delivery-date'] !== null) break;
+    await sleep(50);
+  }
+  assert.equal(outcome['last-delivery-status'], 200, 'the delivery settled');
+  const item = 'feature/recall-a6';
+  assert.equal((await at('POST', `/${PART}/notify`, { headers: bearer(old), body: notice(item, 'open') })).status, 201);
+  const r = await askAt(partBase, email, {}, bearer(old));
+  assert.equal(r.status, 200, r.json && r.json.error);
+  const fresh = r.json.token;
+  assert.equal(r.json.url, rx.url, 'the answer carries the kept URL');
+  const info = await request(partBase, 'GET', '/token', { headers: bearer(fresh) });
+  assert.equal(info.status, 200);
+  assert.equal(info.json.url, rx.url, 'the URL');
+  assert.equal(info.json['last-delivery-date'], outcome['last-delivery-date'], 'the delivery date');
+  assert.equal(info.json['last-delivery-status'], outcome['last-delivery-status'], 'the delivery status');
+  const inv = await request(partBase, 'GET', '/inventory', { headers: bearer(fresh) });
+  assert.deepEqual(idsOf(inv.json.records), [added.json.id], 'the record');
+  const st = await request(partBase, 'GET', '/status', { headers: byToken(fresh, 'rc6', 'rc6-item'), params: { id: added.json.id } });
+  assert.equal(st.status, 200, 'the record by its id');
+  assert.deepEqual(await at('GET', statusPath(item), { headers: bearer(fresh) }), { status: 200, json: [notice(item, 'open')] }, 'the notice');
+});
+
+test('re-call A7: a later ask naming a URL stores it, with no url keeps it, naming null clears it; each answer carries url', async () => {
+  const email = 'recall-a7@example.org';
+  await listEmail(base, email);
+  const u1 = 'https://example.org/recall-a7/one';
+  const u2 = 'https://example.org/recall-a7/two';
+  const first = await tokenAt(base, email);
+  assert.ok(Object.hasOwn(first, 'url'), 'the first answer carries url');
+  assert.equal(first.url, null);
+  let token = first.token;
+  for (const [label, extra, url] of [
+    ['naming a URL', { url: u1 }, u1],
+    ['naming another', { url: u2 }, u2],
+    ['no url', {}, u2],
+    ['null', { url: null }, null],
+    ['no url after null', {}, null],
+  ]) {
+    const r = await askAt(base, email, extra, bearer(token));
+    assert.equal(r.status, 200, label);
+    assert.ok(Object.hasOwn(r.json, 'url'), `${label}: the answer carries url`);
+    assert.equal(r.json.url, url, label);
+    token = r.json.token;
+    assert.equal((await call('GET', '/token', { headers: bearer(token) })).json.url, url, `${label}: as stored`);
+  }
+});
+
+test('re-call A8: a variation and its plain address each renew alone; one\'s renewal leaves the other\'s token working', async () => {
+  const plain = 'recall-a8@example.org';
+  const varied = 'recall-a8+v@example.org';
+  await listEmail(base, plain);
+  const p = (await tokenAt(base, plain)).token;
+  const v = (await tokenAt(base, varied)).token;
+  const works = async (t) => (await call('GET', '/token', { headers: bearer(t) })).status;
+  const v2 = await askAt(base, varied, {}, bearer(v));
+  assert.equal(v2.status, 200, 'the variation renews');
+  assert.equal(await works(p), 200, 'the plain token still works after the variation renews');
+  const p2 = await askAt(base, plain, {}, bearer(p));
+  assert.equal(p2.status, 200, 'the plain address renews with its own token');
+  assert.equal(await works(v2.json.token), 200, 'the variation\'s token still works after the plain address renews');
+  assert.deepEqual(await askAt(base, plain, {}, bearer(v2.json.token)), REFUSED, 'the variation\'s token renews not the plain address');
+  assert.deepEqual(await askAt(base, varied, {}, bearer(p2.json.token)), REFUSED, 'the plain token renews not the variation');
+  const v3 = await askAt(base, varied, {}, bearer(v2.json.token));
+  assert.equal(v3.status, 200, 'the variation renews again with its own');
+  assert.equal(await works(p2.json.token), 200, 'the plain token still works');
+});
+
+test('re-call A9: a first ask answers 201 with no credential, and with a made-up bearer token; its answer carries url', async () => {
+  await listEmail(base, 'recall-a9@example.org');
+  const none = await askAt(base, 'recall-a9@example.org');
+  assert.equal(none.status, 201, none.json && none.json.error);
+  assert.deepEqual(Object.keys(none.json), ['token', 'url', 'date']);
+  assert.equal(none.json.url, null);
+  for (const [i, [label, headers]] of [['a made-up bearer token', bearer('made-up')], ['another address\'s token', bearer(none.json.token)],
+    ['the admin token', asAdmin]].entries()) {
+    const r = await askAt(base, `recall-a9+${i}@example.org`, { url: 'https://example.org/recall-a9' }, headers);
+    assert.equal(r.status, 201, label);
+    assert.deepEqual(Object.keys(r.json), ['token', 'url', 'date'], label);
+    assert.equal(r.json.url, 'https://example.org/recall-a9', label);
+  }
+  assert.equal((await call('GET', '/token', { headers: bearer(none.json.token) })).status, 200, 'a first ask bearing it left it working');
+});
+
+test('re-call A10: a bad body answers 400 with the right token or a wrong one and renews nothing; a post over the limit answers 429', async () => {
+  const email = 'recall-a10@example.org';
+  await listEmail(base, email);
+  const t = (await tokenAt(base, email)).token;
+  for (const [label, headers] of [['the right token', bearer(t)], ['a wrong token', bearer('made-up')]]) {
+    for (const [what, opts, reason] of [
+      ['a url that is no web address', { body: { email, url: 'ftp://x' } }, URL_REASON],
+      ['no email', { body: { url: 'https://example.org' } }, 'email must be a non-empty string'],
+      ['a list', { body: [email] }, 'body must be a JSON object'],
+      ['no JSON', { raw: '{not json' }, 'body is not valid JSON'],
+    ]) {
+      assert.deepEqual(await request(base, 'POST', '/tokens', { headers, ...opts }), { status: 400, json: { error: reason } }, `${label}: ${what}`);
+    }
+  }
+  assert.equal((await call('GET', '/token', { headers: bearer(t) })).status, 200, 'nothing renewed: the token still works');
+  const s = await limitServer();
+  try {
+    await listEmail(s.base, email);
+    const from = { 'X-Real-IP': '203.0.113.77' };
+    const own = await request(s.base, 'POST', '/tokens', { headers: from, body: { email } });
+    assert.equal(own.status, 201);
+    for (let i = 0; i < 4; i++) {
+      assert.deepEqual(await request(s.base, 'POST', '/tokens', { headers: { ...from, ...bearer('made-up') }, body: { email } }), REFUSED);
+    }
+    for (const [label, token] of [['the right token', own.json.token], ['a wrong token', 'made-up']]) {
+      const over = await request(s.base, 'POST', '/tokens', { headers: { ...from, ...bearer(token) }, body: { email } });
+      assert.deepEqual(over, { status: 429, json: { error: 'too many asks' } }, `over the limit, ${label}`);
+    }
+    const elsewhere = await request(s.base, 'POST', '/tokens', { headers: { 'X-Real-IP': '203.0.113.78', ...bearer(own.json.token) }, body: { email } });
+    assert.equal(elsewhere.status, 200, 'the 429 renewed nothing: the token is still current');
+  } finally {
+    await s.close();
+  }
+});
+
+test('re-call A10a: an unknown address with any bearer token gets the 401 of A1; every answer of the tokens endpoint is JSON', async () => {
+  const email = 'recall-a10a@example.org';
+  await listEmail(base, email);
+  const t = (await tokenAt(base, email)).token;
+  const raw = async (b, headers, body) => {
+    const res = await fetch(new URL('/tokens', b), { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body });
+    const text = await res.text();
+    assert.ok(String(res.headers.get('content-type')).startsWith('application/json'), `${res.status}: content-type`);
+    return { status: res.status, json: JSON.parse(text) };
+  };
+  const later = await raw(base, {}, JSON.stringify({ email }));
+  assert.deepEqual(later, REFUSED, 'a later ask with no token');
+  for (const [label, headers] of [['no bearer', {}], ['a made-up bearer', bearer('made-up')], ['a real token', bearer(t)], ['the admin token', asAdmin]]) {
+    for (const unknown of ['recall-a10a-never@example.org', 'recall-a10a-never+x@example.org']) {
+      assert.deepEqual(await raw(base, headers, JSON.stringify({ email: unknown })), later, `${unknown}, ${label}`);
+    }
+  }
+  assert.deepEqual(await raw(base, bearer('made-up'), JSON.stringify({ email })), later, 'a known address, a wrong token');
+  const renewed = await raw(base, bearer(t), JSON.stringify({ email }));
+  assert.equal(renewed.status, 200);
+  assert.equal((await raw(base, {}, JSON.stringify({ email: 'recall-a10a+first@example.org' }))).status, 201);
+  assert.equal((await raw(base, {}, '{not json')).status, 400);
+  const s = await limitServer();
+  try {
+    const from = { 'X-Real-IP': '203.0.113.79' };
+    for (let i = 0; i < 5; i++) await raw(s.base, from, JSON.stringify({ email }));
+    assert.deepEqual(await raw(s.base, from, JSON.stringify({ email })), { status: 429, json: { error: 'too many asks' } });
+  } finally {
+    await s.close();
+  }
+});
+
+test('re-call A11: a deactivated address\'s later ask with the right token is refused; activated, that token works and renews', async () => {
+  const email = 'recall-a11@example.org';
+  await listEmail(base, email);
+  const t = (await tokenAt(base, email)).token;
+  const v = (await tokenAt(base, 'recall-a11+v@example.org')).token;
+  await activate(base, email, false);
+  assert.deepEqual(await askAt(base, email, {}, bearer(t)), REFUSED, 'the right token, deactivated');
+  assert.deepEqual(await askAt(base, 'recall-a11+v@example.org', {}, bearer(v)), REFUSED, 'a variation\'s right token, deactivated');
+  await activate(base, email, true);
+  assert.equal((await call('GET', '/token', { headers: bearer(t) })).status, 200, 'activated, the token works');
+  const r = await askAt(base, email, {}, bearer(t));
+  assert.equal(r.status, 200, 'activated, the token renews');
+  assert.ok(r.json.token !== t, 'a new token');
+  assert.equal((await askAt(base, 'recall-a11+v@example.org', {}, bearer(v))).status, 200, 'the variation renews too');
+});
+
+test('re-call A12: a database made by the service\'s own openDb and filled as the shipped code holds it opens with every row kept and no dropped line', async () => {
+  const dir = mkdtempSync(join(dataDir, 'recall-'));
+  const held = randomBytes(32).toString('base64url');
+  // The tables made by src/db.js, which this change leaves as it is: no table and no column added.
+  const made = openDb({ DATA_DIR: dir });
+  try {
+    made.prepare('INSERT INTO authorized_emails (id, email, active) VALUES (1, ?, 1)').run(HOLDER);
+    made.prepare('INSERT INTO tokens (id, email, token, authorized_email, url, date, last_delivery_date, last_delivery_status) VALUES (1, ?, ?, 1, ?, ?, ?, ?)')
+      .run(HOLDER, held, 'https://example.org/kept', '2026-11-18T10:00:00.000Z', '2026-11-18T10:05:00.000Z', 200);
+    made.prepare(`INSERT INTO externalities (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words, token_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`).run('kept-1', ORG, 'kept-atlas', 'kept-item', 'kept before', 'someone', 'somehow', 'open',
+      '2026-11-18T10:01:00.000Z', null, null);
+    made.prepare('INSERT INTO notices (id, item, state, what, body, received, token_id) VALUES (?, ?, ?, ?, ?, ?, 1)')
+      .run('kept-n1', 'feature/kept', 'open', 'w', '{"item":"feature/kept","state":"open","what":"w"}', '2026-11-18T10:02:00.000Z');
+    made.prepare('INSERT INTO thirdparty (id, last_delivery_date, last_delivery_status) VALUES (1, ?, ?)').run('2026-11-18T10:03:00.000Z', 204);
+  } finally {
+    made.close();
+  }
+  const TABLES = ['authorized_emails', 'tokens', 'externalities', 'notices', 'thirdparty'];
+  const rows = () => {
+    const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
+    try {
+      return Object.fromEntries(TABLES.map((t) => [t, db.prepare(`SELECT * FROM ${t} ORDER BY id`).all().map((r) => ({ ...r }))]));
+    } finally {
+      db.close();
+    }
+  };
+  const before = rows();
+  const s = await startOn(dir);
+  try {
+    assert.deepEqual(s.lines, [], 'no dropped line');
+    assert.deepEqual(rows(), before, 'every row kept');
+    const inv = await request(s.base, 'GET', '/inventory', { headers: bearer(held) });
+    assert.equal(inv.status, 200, 'the token held from before opens a token route');
+    assert.deepEqual(idsOf(inv.json.records), ['kept-1']);
+    const r = await askAt(s.base, HOLDER, {}, bearer(held));
+    assert.equal(r.status, 200, 'the held token renews');
+    assert.equal(r.json.url, 'https://example.org/kept', 'its URL kept');
+    const again = await request(s.base, 'GET', '/inventory', { headers: bearer(r.json.token) });
+    assert.deepEqual(idsOf(again.json.records), ['kept-1'], 'the record passes to the new token');
   } finally {
     await s.close();
   }
