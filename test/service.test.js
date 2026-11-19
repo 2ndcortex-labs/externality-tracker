@@ -12,6 +12,7 @@ import { createServer } from '../src/server.js';
 import { timeoutMs } from '../src/deliver.js';
 import { loadAddressKey, loadAdminToken } from '../src/auth.js';
 import { LIMITS, makeLimiter } from '../src/routes.js';
+import { openDb } from '../src/db.js';
 import { networkInterfaces } from 'node:os';
 import { parseAllow, resolveTarget, postOnce, refusedList } from '../src/thirdparty.js';
 
@@ -2252,13 +2253,16 @@ test('re-call A4: a later ask with the current token answers 200 with three fiel
   const email = 'recall-a4@example.org';
   await listEmail(base, email);
   const first = await tokenAt(base, email);
+  await sleep(5); // the two dates cannot fall in one millisecond
+  const t0 = new Date().toISOString();
   const r = await askAt(base, email, {}, bearer(first.token));
   assert.equal(r.status, 200, r.json && r.json.error);
   assert.deepEqual(Object.keys(r.json), ['token', 'url', 'date']);
   assert.ok(r.json.token !== first.token, 'a different token');
   assert.ok(BASE64URL_32_BYTES.test(r.json.token), 'the new token is 32 bytes as base64url');
   assert.match(r.json.date, ISO);
-  assert.ok(r.json.date >= first.date, 'dated no earlier than the first');
+  assert.ok(r.json.date >= t0, 'dated when the new token was made');
+  assert.notEqual(r.json.date, first.date, 'a new date');
   assert.equal(r.json.url, null);
   assert.equal((await call('GET', '/token', { headers: bearer(r.json.token) })).json.date, r.json.date, 'the date stored with the new token');
   const db = openMain();
@@ -2438,6 +2442,7 @@ test('re-call A10a: an unknown address with any bearer token gets the 401 of A1;
       assert.deepEqual(await raw(base, headers, JSON.stringify({ email: unknown })), later, `${unknown}, ${label}`);
     }
   }
+  assert.deepEqual(await raw(base, bearer('made-up'), JSON.stringify({ email })), later, 'a known address, a wrong token');
   const renewed = await raw(base, bearer(t), JSON.stringify({ email }));
   assert.equal(renewed.status, 200);
   assert.equal((await raw(base, {}, JSON.stringify({ email: 'recall-a10a+first@example.org' }))).status, 201);
@@ -2468,24 +2473,12 @@ test('re-call A11: a deactivated address\'s later ask with the right token is re
   assert.equal((await askAt(base, 'recall-a11+v@example.org', {}, bearer(v))).status, 200, 'the variation renews too');
 });
 
-test('re-call A12: a database made and filled in the shape main makes opens with every row kept and no dropped line', async () => {
+test('re-call A12: a database made by the service\'s own openDb and filled as the shipped code holds it opens with every row kept and no dropped line', async () => {
   const dir = mkdtempSync(join(dataDir, 'recall-'));
   const held = randomBytes(32).toString('base64url');
-  const made = new DatabaseSync(join(dir, 'externalities.sqlite'));
+  // The tables made by src/db.js, which this change leaves as it is: no table and no column added.
+  const made = openDb({ DATA_DIR: dir });
   try {
-    // The tables exactly as src/db.js on main makes them; this change adds no table and no column.
-    made.exec(`CREATE TABLE authorized_emails (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE,
-      active INTEGER NOT NULL DEFAULT 1)`);
-    made.exec(`CREATE TABLE tokens (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, token TEXT NOT NULL UNIQUE,
-      authorized_email INTEGER NOT NULL REFERENCES authorized_emails(id), url TEXT, date TEXT NOT NULL,
-      last_delivery_date TEXT, last_delivery_status INTEGER)`);
-    made.exec(`CREATE TABLE externalities (
-      id TEXT PRIMARY KEY, org TEXT, atlas TEXT, item TEXT, what TEXT,
-      who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
-      cleared_date TEXT, cleared_words TEXT, token_id INTEGER NOT NULL REFERENCES tokens(id))`);
-    made.exec(`CREATE TABLE notices (id TEXT PRIMARY KEY, item TEXT, state TEXT, what TEXT, body TEXT, received TEXT,
-      token_id INTEGER NOT NULL REFERENCES tokens(id))`);
-    made.exec('CREATE TABLE thirdparty (id INTEGER PRIMARY KEY CHECK (id = 1), last_delivery_date TEXT, last_delivery_status INTEGER)');
     made.prepare('INSERT INTO authorized_emails (id, email, active) VALUES (1, ?, 1)').run(HOLDER);
     made.prepare('INSERT INTO tokens (id, email, token, authorized_email, url, date, last_delivery_date, last_delivery_status) VALUES (1, ?, ?, 1, ?, ?, ?, ?)')
       .run(HOLDER, held, 'https://example.org/kept', '2026-11-18T10:00:00.000Z', '2026-11-18T10:05:00.000Z', 200);
