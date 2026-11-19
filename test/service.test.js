@@ -676,19 +676,22 @@ test('A9: the sixth post from one caller within a minute gets 429, whatever the 
     await listEmail(s.base, 'limit@example.org');
     const from = { 'X-Real-IP': '203.0.113.9' };
     const answers = [];
-    for (const opts of [
+    let current; // the address's then-current token: a later ask bears it
+    for (const { renew, ...opts } of [
       { body: { email: 'limit@example.org' } },
       { body: { email: 'nobody@example.org' } },
       { body: {} },
-      { body: { email: 'limit@example.org' } },
+      { body: { email: 'limit@example.org' }, renew: true },
       { raw: '{not json' },
     ]) {
-      answers.push((await request(s.base, 'POST', '/tokens', { headers: from, ...opts })).status);
+      const r = await request(s.base, 'POST', '/tokens', { headers: renew ? { ...from, ...bearer(current) } : from, ...opts });
+      if (r.json && r.json.token) current = r.json.token;
+      answers.push(r.status);
     }
     assert.deepEqual(answers, [201, 401, 400, 200, 400]);
     const sixth = await request(s.base, 'POST', '/tokens', { headers: from, body: { email: 'limit@example.org' } });
     assert.deepEqual(sixth, { status: 429, json: { error: 'too many asks' } });
-    const another = await request(s.base, 'POST', '/tokens', { headers: { 'X-Real-IP': '203.0.113.10' }, body: { email: 'limit@example.org' } });
+    const another = await request(s.base, 'POST', '/tokens', { headers: { 'X-Real-IP': '203.0.113.10', ...bearer(current) }, body: { email: 'limit@example.org' } });
     assert.equal(another.status, 200, "another caller is not held by this one's count");
     // Without X-Real-IP the connection's own address is the caller.
     for (let i = 0; i < 5; i++) {
