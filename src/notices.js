@@ -1,5 +1,6 @@
 // The two open addresses: a notice taken as sent once it passes the test, and the status read by an item's reference.
-// Neither reads a credential; the hard-to-guess part in the path is their only guard (see server.js).
+// Both want a token as `Authorization: Bearer <token>` beside the hard-to-guess part in the path (see server.js);
+// each notice belongs to the token's row that sent it, and a status read returns that row's notices only.
 import { randomUUID } from 'node:crypto';
 import { HttpError } from './auth.js';
 
@@ -44,21 +45,21 @@ export function test(text) {
   return body;
 }
 
-// Keeps the notice as its own row, the body's text as received; answers its id and nothing else.
-// The parsed record follows the answer, for the caller's passing-on; it is never sent back.
-export function keep(db, text) {
+// Keeps the notice as its own row under the sending token's row, the body's text as received; answers its id and
+// nothing else. The parsed record follows the answer, for the caller's passing-on; it is never sent back.
+export function keep(db, text, tokenId) {
   const body = test(text);
   const id = randomUUID();
-  db.prepare('INSERT INTO notices (id, item, state, what, body, received) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(id, body.item, body.state, body.what, text, new Date().toISOString());
+  db.prepare('INSERT INTO notices (id, item, state, what, body, received, token_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(id, body.item, body.state, body.what, text, new Date().toISOString(), tokenId);
   return [201, { id }, body];
 }
 
-// Every notice kept for the reference, matched exactly, newest received first, the later-inserted first in one instant.
-// Answers the JSON list as text, built from the stored bodies themselves, so each comes back whole as it was sent.
-export function readStatus(db, url) {
+// The calling token's notices for the reference, matched exactly, newest received first, the later-inserted first in
+// one instant. Answers the JSON list as text, built from the stored bodies themselves, so each comes back whole as sent.
+export function readStatus(db, url, tokenId) {
   const item = url.searchParams.get('item');
   if (!item) throw new HttpError(400, "item is required: the item's reference");
-  const rows = db.prepare('SELECT body FROM notices WHERE item = ? ORDER BY received DESC, rowid DESC').all(item);
+  const rows = db.prepare('SELECT body FROM notices WHERE item = ? AND token_id = ? ORDER BY received DESC, rowid DESC').all(item, tokenId);
   return [200, `[${rows.map((row) => row.body).join(',')}]`];
 }
