@@ -2,7 +2,7 @@
 
 A small service that records and tracks externalities: things that must happen out of band before a road plans item can complete. Node 24, zero dependencies, `node:http` and `node:sqlite`.
 
-road plans: nethub/nexus/roadwork of the BAA Workspace (temporary authority)
+road plans: corhub/nexus/roadwork of the project `nexus-roadwork`
 
 ## Run
 
