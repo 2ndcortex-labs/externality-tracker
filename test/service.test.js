@@ -5,35 +5,52 @@ import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { createServer } from '../src/server.js';
 import { timeoutMs } from '../src/deliver.js';
-import { loadAddressKey } from '../src/auth.js';
+import { loadAddressKey, loadAdminToken } from '../src/auth.js';
+import { LIMITS, makeLimiter } from '../src/routes.js';
 import { networkInterfaces } from 'node:os';
 import { parseAllow, resolveTarget, postOnce, refusedList } from '../src/thirdparty.js';
 
 const ORG = 'test-org';
-const KEY = 'test-key-0123456789';
+const OLD_KEY = 'test-key-0123456789'; // a value of the old org key's kind: it opens nothing now
+const ADMIN = randomBytes(32).toString('base64url'); // the test servers' ADMIN_TOKEN, never printed
+const HOLDER = 'holder@example.org'; // every address here is a made-up one at example.org
 const FIELDS = ['id', 'org-slug', 'atlas-slug', 'item-slug', 'what', 'who-acts', 'how-observed',
   'state', 'set-date', 'cleared-date', 'cleared-words'];
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DELIVERY_TIMEOUT = 400; // the test server's DELIVERY_TIMEOUT_MS
 const NEGATIVE_WAIT = DELIVERY_TIMEOUT + 300; // a wait for nothing to arrive: the timeout and a margin
+const URL_REASON = 'url must be an absolute http or https URL';
+const ADDRESS_REASON = 'email must be one address: one @, text on both sides, no space and no +';
+const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{43}$/;
+const REFUSED = { status: 401, json: { error: 'refused' } };
+const DROPPED = 'externality-tracker: dropped old tables externalities, notices, tokens';
+// The main and address servers serve many tests from one caller, so each is given numbers no test reaches; the limit's
+// own tests (A9, A10) and every other server run on LIMITS, the service's own numbers.
+const ROOMY = { perCaller: 1_000_000, total: 1_000_000 };
 
 let server;
 let base;
 let dataDir;
-let TOKEN; // a token of scope `all`, never printed
+let TOKEN; // HOLDER's token on the main server, never printed
+
+const listenOn = async (s) => {
+  await new Promise((resolve) => s.listen(0, '127.0.0.1', resolve));
+  return `http://127.0.0.1:${s.address().port}`;
+};
 
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'externality-tracker-'));
-  server = createServer({ ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, DATA_DIR: dataDir, DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT) });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  base = `http://127.0.0.1:${server.address().port}`;
-  TOKEN = (await mintToken('all')).token;
+  server = createServer({ ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, DATA_DIR: dataDir, DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT) },
+    { limits: ROOMY });
+  base = await listenOn(server);
+  await listEmail(base, HOLDER);
+  TOKEN = (await tokenAt(base, HOLDER)).token;
 });
 
 after(async () => {
@@ -43,8 +60,8 @@ after(async () => {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function call(method, path, { headers = {}, params = {}, body, raw } = {}) {
-  const url = new URL(path, base);
+async function request(b, method, path, { headers = {}, params = {}, body, raw } = {}) {
+  const url = new URL(path, b);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const init = { method, headers: { ...headers } };
   if (raw !== undefined) init.body = raw;
@@ -55,17 +72,46 @@ async function call(method, path, { headers = {}, params = {}, body, raw } = {})
   return { status: res.status, json: text ? JSON.parse(text) : null };
 }
 
-const auth = (atlas, item, extra = {}) => ({
-  'X-Org-Slug': ORG, 'Authorization': `Bearer ${KEY}`,
-  ...(atlas ? { 'X-Atlas-Slug': atlas } : {}), ...(item ? { 'X-Item-Slug': item } : {}), ...extra,
-});
+const call = (method, path, opts) => request(base, method, path, opts);
 
-// A consumer-token call: the token and the slugs, no org key.
+const bearer = (token) => ({ 'Authorization': `Bearer ${token}` });
+const asAdmin = bearer(ADMIN);
+
+// A token call: the bearer token and the slugs.
 const byToken = (token, atlas, item, extra = {}) => ({
-  'X-Consumer-Token': token,
+  ...bearer(token),
   ...(atlas ? { 'X-Atlas-Slug': atlas } : {}), ...(item ? { 'X-Item-Slug': item } : {}), ...extra,
 });
+const auth = (atlas, item, extra = {}) => byToken(TOKEN, atlas, item, { 'X-Org-Slug': ORG, ...extra });
 const read = (atlas, item, extra) => byToken(TOKEN, atlas, item, extra);
+
+// The admin endpoints and the ask, against any server. No failure message carries a token.
+async function listEmail(b, email) {
+  const r = await request(b, 'POST', '/emails', { headers: asAdmin, body: { email } });
+  assert.ok(r.status === 201 || r.status === 200, JSON.stringify(r.json));
+  return r.json;
+}
+
+async function activate(b, email, active) {
+  const r = await request(b, 'POST', '/emails/active', { headers: asAdmin, body: { email, active } });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  return r.json;
+}
+
+const askAt = (b, email, extra = {}, headers = {}) => request(b, 'POST', '/tokens', { headers, body: { email, ...extra } });
+
+async function tokenAt(b, email, extra) {
+  const r = await askAt(b, email, extra);
+  assert.ok(r.status === 201 || r.status === 200, r.json && r.json.error);
+  return r.json;
+}
+
+let asked = 0;
+const variation = () => `holder+t${++asked}@example.org`;
+// A token of its own on the main server: a new variation of HOLDER, with the URL when given.
+const newToken = (url) => tokenAt(base, variation(), url === undefined ? {} : { url });
+
+const openMain = () => new DatabaseSync(join(dataDir, 'externalities.sqlite'));
 
 const BODY = { 'what': 'a thing is true', 'who-acts': 'the operator', 'how-observed': 'by a check' };
 
@@ -75,25 +121,7 @@ async function addOne(atlas, item, body = BODY) {
   return r.json.id;
 }
 
-// Mints through the endpoint under the org key; the failure message carries the reason only, never a token.
-async function mintToken(scope, url) {
-  const body = url === undefined ? { scope } : { scope, url };
-  const r = await call('POST', '/tokens', { headers: auth(), body });
-  assert.equal(r.status, 201, r.json && r.json.error);
-  return r.json;
-}
-
 const idsOf = (recs) => recs.map((r) => r.id).sort();
-
-test('GET / answers without a key', async () => {
-  const r = await call('GET', '/');
-  assert.equal(r.status, 200);
-  assert.deepEqual(Object.keys(r.json).sort(), ['node', 'ok', 'service', 'started']);
-  assert.equal(r.json.ok, true);
-  assert.equal(r.json.service, 'externality-tracker');
-  assert.equal(r.json.node, process.version);
-  assert.match(r.json.started, ISO);
-});
 
 test('add returns 201 with an id and the record', async () => {
   const r = await call('POST', '/add', { headers: auth('atlas-a', 'item-a'), body: BODY });
@@ -236,31 +264,30 @@ test('precedence: org-slug from header, param, header wins', async () => {
   assert.equal((await call('GET', '/inventory', { headers: { ...h, 'X-Org-Slug': 'wrong' }, params: { 'org-slug': ORG } })).status, 401);
 });
 
-// The key is read by add and /tokens only, from `Authorization: Bearer <key>`; no assertion message carries it.
-test('bearer: the scheme case-insensitively, the key trimmed; another scheme, an empty value, the old header and the parameter are missing', async () => {
-  const s = { 'X-Org-Slug': ORG, 'X-Atlas-Slug': 'bearer-atlas', 'X-Item-Slug': 'bearer-item' };
-  for (const [path, body] of [['/add', BODY], ['/tokens', { scope: 'bearer-atlas' }]]) {
-    for (const [label, headers] of [
-      ['Bearer <key>', { ...s, 'Authorization': `Bearer ${KEY}` }],
-      ['BEARER, two spaces, a trailing space', { ...s, 'authorization': `BEARER  ${KEY} ` }],
-    ]) {
-      const r = await call('POST', path, { headers, body });
-      assert.equal(r.status, 201, `${path} ${label}: ${r.json && r.json.error}`);
-    }
-    for (const [label, headers, params, reason] of [
-      ['another scheme', { ...s, 'Authorization': `Basic ${KEY}` }, {}, 'missing externality key'],
-      ['the scheme alone', { ...s, 'Authorization': 'Bearer' }, {}, 'missing externality key'],
-      ['the scheme and a space', { ...s, 'Authorization': 'Bearer ' }, {}, 'missing externality key'],
-      ['a tab after the scheme', { ...s, 'Authorization': `Bearer\t${KEY}` }, {}, 'missing externality key'],
-      ['the old header', { ...s, 'X-Externality-Key': KEY }, {}, 'missing externality key'],
-      ['the parameter', s, { 'externality-key': KEY }, 'missing externality key'],
-      ['a wrong key', { ...s, 'Authorization': 'Bearer wrong' }, {}, 'wrong externality key'],
-      ['another org', { ...s, 'X-Org-Slug': 'other', 'Authorization': `Bearer ${KEY}` }, {}, 'org slug does not match the key'],
-    ]) {
-      const r = await call('POST', path, { headers, params, body });
-      assert.equal(r.status, 401, `${path} ${label}`);
-      assert.equal(r.json.error, reason, `${path} ${label}`);
-    }
+// The token is read from `Authorization: Bearer <token>` only; no assertion message carries it.
+test('bearer: the scheme case-insensitively, the token trimmed; another scheme, an empty value, an old header and a parameter are missing', async () => {
+  const s = { 'X-Atlas-Slug': 'bearer-atlas', 'X-Item-Slug': 'bearer-item' };
+  for (const [label, headers] of [
+    ['Bearer <token>', { ...s, 'Authorization': `Bearer ${TOKEN}` }],
+    ['BEARER, two spaces, a trailing space', { ...s, 'authorization': `BEARER  ${TOKEN} ` }],
+  ]) {
+    const r = await call('POST', '/add', { headers, body: BODY });
+    assert.equal(r.status, 201, `${label}: ${r.json && r.json.error}`);
+  }
+  for (const [label, headers, params, reason] of [
+    ['another scheme', { ...s, 'Authorization': `Basic ${TOKEN}` }, {}, 'token is required'],
+    ['the scheme alone', { ...s, 'Authorization': 'Bearer' }, {}, 'token is required'],
+    ['the scheme and a space', { ...s, 'Authorization': 'Bearer ' }, {}, 'token is required'],
+    ['a tab after the scheme', { ...s, 'Authorization': `Bearer\t${TOKEN}` }, {}, 'token is required'],
+    ['the old key header', { ...s, 'X-Externality-Key': TOKEN }, {}, 'token is required'],
+    ['the old token header', { ...s, 'X-Consumer-Token': TOKEN }, {}, 'token is required'],
+    ['a parameter', s, { 'token': TOKEN }, 'token is required'],
+    ['a wrong token', { ...s, 'Authorization': 'Bearer wrong' }, {}, 'unknown token'],
+    ['another org', { ...s, 'X-Org-Slug': 'other', 'Authorization': `Bearer ${TOKEN}` }, {}, 'org slug does not match'],
+  ]) {
+    const r = await call('POST', '/add', { headers, params, body: BODY });
+    assert.equal(r.status, 401, label);
+    assert.equal(r.json.error, reason, label);
   }
 });
 
@@ -270,28 +297,28 @@ for (const [name, header, param, field] of [
 ]) {
   test(`precedence: ${name} from header, param, header wins`, async () => {
     const other = name === 'atlas-slug' ? { 'X-Item-Slug': 'prec-item' } : { 'X-Atlas-Slug': 'prec-atlas' };
-    const base = { 'X-Org-Slug': ORG, 'Authorization': `Bearer ${KEY}`, ...other };
-    let r = await call('POST', '/add', { headers: { ...base, [header]: 'from-header' }, body: BODY });
+    const h0 = { 'X-Org-Slug': ORG, 'Authorization': `Bearer ${TOKEN}`, ...other };
+    let r = await call('POST', '/add', { headers: { ...h0, [header]: 'from-header' }, body: BODY });
     assert.equal(r.json.record[field], 'from-header');
-    r = await call('POST', '/add', { headers: base, params: { [param]: 'from-param' }, body: BODY });
+    r = await call('POST', '/add', { headers: h0, params: { [param]: 'from-param' }, body: BODY });
     assert.equal(r.json.record[field], 'from-param');
-    r = await call('POST', '/add', { headers: { ...base, [header]: 'from-header' }, params: { [param]: 'from-param' }, body: BODY });
+    r = await call('POST', '/add', { headers: { ...h0, [header]: 'from-header' }, params: { [param]: 'from-param' }, body: BODY });
     assert.equal(r.status, 201);
     assert.equal(r.json.record[field], 'from-header');
   });
 }
 
-test('auth: wrong key, missing key, other org are 401 with a reason', async () => {
-  for (const headers of [
-    { 'X-Org-Slug': ORG, 'Authorization': 'Bearer wrong' },
-    { 'X-Org-Slug': ORG },
-    { 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${KEY}` },
+test('auth: a wrong token, no token or another org is 401 with a reason', async () => {
+  for (const [headers, reason] of [
+    [{ 'X-Org-Slug': ORG, 'Authorization': 'Bearer wrong' }, 'unknown token'],
+    [{ 'X-Org-Slug': ORG }, 'token is required'],
+    [{ 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${TOKEN}` }, 'org slug does not match'],
   ]) {
     for (const [method, path, body] of [['GET', '/inventory'], ['POST', '/add', BODY], ['GET', '/status'],
-      ['POST', '/update', { id: 'x', what: 'x' }], ['POST', '/tokens', { scope: 'all' }]]) {
+      ['POST', '/update', { id: 'x', what: 'x' }]]) {
       const r = await call(method, path, { headers: { ...headers, 'X-Atlas-Slug': 'n', 'X-Item-Slug': 'i' }, body });
-      assert.equal(r.status, 401);
-      assert.equal(typeof r.json.error, 'string');
+      assert.equal(r.status, 401, `${method} ${path}`);
+      assert.equal(r.json.error, reason, `${method} ${path}`);
     }
   }
 });
@@ -303,169 +330,54 @@ test('bad body is 400, unknown id 404, DELETE and unknown routes 404', async () 
   assert.equal((await call('POST', '/add', { headers: auth('n', 'i'), body: [1, 2] })).status, 400);
   assert.equal((await call('POST', '/update', { headers: read('n', 'i'), raw: '' })).status, 400);
   assert.equal((await call('GET', '/status', { headers: read('n', 'i'), params: { id: 'missing' } })).status, 404);
-  for (const path of ['/', '/add', '/update', '/status', '/inventory', '/elsewhere']) {
-    r = await call('DELETE', path, { headers: auth('n', 'i') });
-    assert.equal(r.status, 404, `DELETE ${path}`);
-    assert.equal(typeof r.json.error, 'string');
+  for (const path of ['/', '/add', '/update', '/status', '/inventory', '/tokens', '/emails', '/emails/active', '/elsewhere']) {
+    for (const headers of [auth('n', 'i'), asAdmin]) {
+      r = await call('DELETE', path, { headers, body: { email: HOLDER } });
+      assert.equal(r.status, 404, `DELETE ${path}`);
+      assert.equal(typeof r.json.error, 'string');
+    }
   }
-  for (const [method, path] of [['GET', '/elsewhere'], ['GET', '/add'], ['POST', '/status'], ['PUT', '/update'], ['POST', '/']]) {
+  for (const [method, path] of [['GET', '/elsewhere'], ['GET', '/add'], ['POST', '/status'], ['PUT', '/update'], ['POST', '/'],
+    ['GET', '/tokens'], ['GET', '/emails'], ['PUT', '/emails'], ['PATCH', '/emails/active'], ['POST', '/emails/delete']]) {
     assert.equal((await call(method, path, { headers: auth('n', 'i') })).status, 404, `${method} ${path}`);
   }
+  assert.equal((await call('GET', '/token', { headers: read() })).status, 200, 'the listed address was not removed');
 });
 
-test('the server refuses to start with EXTERNALITY_KEY or ORG_SLUG unset', () => {
-  for (const env of [{ ORG_SLUG: 'x', EXTERNALITY_KEY: '' }, { ORG_SLUG: '', EXTERNALITY_KEY: 'k' }]) {
-    const r = spawnSync(process.execPath, ['src/server.js'], {
-      cwd: ROOT,
-      env: { PATH: process.env.PATH, ...env, DATA_DIR: dataDir, PORT: '0' },
-      timeout: 10000,
-      encoding: 'utf8',
-    });
-    assert.notEqual(r.status, 0);
-    assert.notEqual(r.status, null, 'exited on its own');
-    assert.match(r.stderr, /refusing to start/);
-  }
-});
-
-// The consumer token: minted under the org key, read by status, update and inventory within its scope.
-// No assertion message below carries a token.
-
-const SCOPE_REASON = 'scope must be all or a comma-delineated list of atlas slugs';
-const URL_REASON = 'url must be an absolute http or https URL';
-const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{43}$/;
-
-test('tokens: a mint answers 201 with the token, the normalised scope, the url and the date', async () => {
-  const t = await mintToken('all');
-  assert.deepEqual(Object.keys(t), ['token', 'scope', 'url', 'date']);
-  assert.ok(BASE64URL_32_BYTES.test(t.token), 'the token is 32 bytes as base64url');
-  assert.ok(t.token !== TOKEN, 'each mint is a new token');
-  assert.equal(t.scope, 'all');
-  assert.equal(t.url, null);
-  assert.match(t.date, ISO);
-  assert.ok(t.date.endsWith('Z') && !Number.isNaN(Date.parse(t.date)), 'the date is ISO 8601 UTC');
-  for (const scope of [' all ', 'all,all']) assert.equal((await mintToken(scope)).scope, 'all', scope);
-  assert.equal((await mintToken('All')).scope, 'All');
-  assert.equal((await mintToken('a', null)).url, null);
-  const hook = 'http://127.0.0.1:1/hook?x=1&y=two';
-  const withUrl = await mintToken(' b, a ,a', hook);
-  assert.equal(withUrl.scope, 'b,a');
-  assert.equal(withUrl.url, hook);
-  assert.equal((await mintToken('none', 'http://127.0.0.1:1/in')).url, 'http://127.0.0.1:1/in');
-
-  const db = new DatabaseSync(join(dataDir, 'externalities.sqlite'));
-  try {
-    const columns = db.prepare('PRAGMA table_info(tokens)').all().map((c) => c.name);
-    assert.deepEqual(columns, ['token', 'scope', 'url', 'date', 'last_delivery_date', 'last_delivery_status']);
-    const row = db.prepare('SELECT * FROM tokens').all().find((r) => r.token === withUrl.token);
-    assert.ok(row, 'the stored row holds the token as returned');
-    assert.equal(row.scope, 'b,a');
-    assert.equal(row.url, hook);
-    assert.equal(row.date, withUrl.date);
-    assert.equal(row.last_delivery_date, null);
-    assert.equal(row.last_delivery_status, null);
-  } finally {
-    db.close();
-  }
-});
-
-test('tokens: a bad body, scope or url answers 400 with its reason', async () => {
-  const mint = (opts) => call('POST', '/tokens', { headers: auth(), ...opts });
-  for (const body of [{}, { scope: '' }, { scope: 'all,a' }, { scope: 'a,,b' }, { scope: ' , ' }, { scope: 42 },
-    { scope: ['a'] }, { url: 'https://example.com' }]) {
-    const r = await mint({ body });
-    assert.equal(r.status, 400, JSON.stringify(body));
-    assert.equal(r.json.error, SCOPE_REASON);
-  }
-  for (const url of ['ftp://x', 'not a url', 42, '', '/relative', { href: 'https://example.com' }]) {
-    const r = await mint({ body: { scope: 'all', url } });
-    assert.equal(r.status, 400, JSON.stringify(url));
-    assert.equal(r.json.error, URL_REASON);
-  }
-  let r = await mint({ body: [1] });
-  assert.equal(r.status, 400);
-  assert.equal(r.json.error, 'body must be a JSON object');
-  r = await mint({ raw: '{not json' });
-  assert.equal(r.status, 400);
-  assert.equal(r.json.error, 'body is not valid JSON');
-});
-
-test('auth: status, update and inventory read the token; add and tokens read the key', async () => {
-  const id = await addOne('cred-atlas', 'cred-item');
-  const slugs = { 'X-Atlas-Slug': 'cred-atlas', 'X-Item-Slug': 'cred-item' };
-  const unknown = byToken('not-a-token', 'cred-atlas', 'cred-item');
-  for (const [method, path, opts] of [
-    ['GET', '/status', { params: { id } }],
-    ['POST', '/update', { body: { id, what: 'changed by a token' } }],
-    ['GET', '/inventory', {}],
-  ]) {
-    const at = `${method} ${path}`;
-    for (const headers of [slugs, { ...slugs, 'X-Org-Slug': ORG }, { ...slugs, 'X-Org-Slug': ORG, 'Authorization': `Bearer ${KEY}` }]) {
-      const r = await call(method, path, { ...opts, headers });
-      assert.equal(r.status, 401, at);
-      assert.equal(r.json.error, 'consumer token is required', at);
-    }
-    for (const headers of [unknown, byToken(KEY, 'cred-atlas', 'cred-item')]) {
-      const r = await call(method, path, { ...opts, headers });
-      assert.equal(r.status, 401, at);
-      assert.equal(r.json.error, 'unknown consumer token', at);
-    }
-    let r = await call(method, path, { ...opts, headers: read('cred-atlas', 'cred-item') });
-    assert.equal(r.status, 200, `${at} by header`);
-    r = await call(method, path, { ...opts, headers: slugs, params: { ...opts.params, 'consumer-token': TOKEN } });
-    assert.equal(r.status, 401, `${at} by parameter`);
-    assert.equal(r.json.error, 'consumer token is required', `${at} by parameter`);
-    r = await call(method, path, { ...opts, headers: read('cred-atlas', 'cred-item'), params: { ...opts.params, 'consumer-token': 'not-a-token' } });
-    assert.equal(r.status, 200, `${at}: the header wins`);
-    r = await call(method, path, { ...opts, headers: unknown, params: { ...opts.params, 'consumer-token': TOKEN } });
-    assert.equal(r.status, 401, `${at}: the header wins`);
-    assert.equal(r.json.error, 'unknown consumer token', at);
-  }
-  for (const [path, body] of [['/add', BODY], ['/tokens', { scope: 'all' }]]) {
-    for (const [headers, reason] of [
-      [read('cred-atlas', 'cred-item'), 'missing externality key'],
-      [read('cred-atlas', 'cred-item', { 'X-Org-Slug': ORG }), 'missing externality key'],
-      [slugs, 'missing externality key'],
-      [{ ...slugs, 'X-Org-Slug': ORG, 'Authorization': 'Bearer wrong' }, 'wrong externality key'],
-      [{ ...slugs, 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${KEY}` }, 'org slug does not match the key'],
-    ]) {
-      const r = await call('POST', path, { headers, body });
-      assert.equal(r.status, 401, `${path}: ${reason}`);
-      assert.equal(r.json.error, reason, path);
-    }
-  }
-});
-
-test("url parameters: externality-key and consumer-token are not read, the slugs' parameters still are", async () => {
+test("url parameters: no credential is read from one; the slugs' parameters still are", async () => {
   const id = await addOne('urlp-atlas', 'urlp-item');
   const slugs = { 'X-Org-Slug': ORG, 'X-Atlas-Slug': 'urlp-atlas', 'X-Item-Slug': 'urlp-item' };
-  const key = { 'externality-key': KEY };
-  const token = { 'consumer-token': TOKEN };
-  for (const [method, path, opts, reason] of [
-    ['POST', '/add', { body: BODY }, 'missing externality key'],
-    ['POST', '/tokens', { body: { scope: 'urlp-atlas' } }, 'missing externality key'],
-    ['GET', '/status', { params: { id } }, 'consumer token is required'],
-    ['POST', '/update', { body: { id, what: 'changed by a parameter' } }, 'consumer token is required'],
-    ['GET', '/inventory', {}, 'consumer token is required'],
-    ['GET', '/token', {}, 'consumer token is required'],
+  for (const [method, path, opts] of [
+    ['POST', '/add', { body: BODY }],
+    ['GET', '/status', { params: { id } }],
+    ['POST', '/update', { body: { id, what: 'changed by a parameter' } }],
+    ['GET', '/inventory', {}],
+    ['GET', '/token', {}],
+    ['GET', '/thirdparty', {}],
   ]) {
-    for (const [label, p] of [['externality-key', key], ['consumer-token', token], ['both', { ...key, ...token }]]) {
-      const r = await call(method, path, { ...opts, headers: slugs, params: { ...opts.params, ...p } });
-      assert.equal(r.status, 401, `${method} ${path} by ${label}`);
-      assert.equal(r.json.error, reason, `${method} ${path} by ${label}`);
+    for (const name of ['token', 'consumer-token', 'externality-key', 'authorization']) {
+      const r = await call(method, path, { ...opts, headers: slugs, params: { ...opts.params, [name]: TOKEN } });
+      assert.equal(r.status, 401, `${method} ${path} by ${name}`);
+      assert.equal(r.json.error, 'token is required', `${method} ${path} by ${name}`);
+    }
+  }
+  for (const [path, body] of [['/emails', { email: 'urlp@example.org' }], ['/emails/active', { email: HOLDER, active: false }]]) {
+    for (const name of ['admin-token', 'token', 'authorization']) {
+      const r = await call('POST', path, { params: { [name]: ADMIN }, body });
+      assert.equal(r.status, 401, `${path} by ${name}`);
+      assert.equal(r.json.error, 'admin token is required', `${path} by ${name}`);
     }
   }
 
-  // The slugs as parameters beside the accepted headers: all three on add, the org slug on tokens and GET /token,
+  // The slugs as parameters beside the bearer header: all three on add, the org slug on GET /token,
   // the atlas and item slugs on status, update and inventory.
-  const bearerOnly = { 'Authorization': `Bearer ${KEY}` };
+  const bearerOnly = bearer(TOKEN);
   const tp = { 'atlas-slug': 'urlp-param-atlas', 'item-slug': 'urlp-param-item' };
   let r = await call('POST', '/add', { headers: bearerOnly, params: { 'org-slug': ORG, ...tp }, body: BODY });
   assert.equal(r.status, 201, r.json && r.json.error);
   assert.equal(r.json.record['atlas-slug'], 'urlp-param-atlas');
   assert.equal(r.json.record['item-slug'], 'urlp-param-item');
   const pid = r.json.id;
-  r = await call('POST', '/tokens', { headers: bearerOnly, params: { 'org-slug': ORG }, body: { scope: 'urlp-param-atlas' } });
-  assert.equal(r.status, 201, r.json && r.json.error);
   r = await call('GET', '/status', { headers: read(), params: { ...tp, id: pid } });
   assert.equal(r.status, 200, r.json && r.json.error);
   assert.equal(r.json.record.id, pid);
@@ -502,20 +414,21 @@ test('org slug: optional on a token call, refused when it differs; another org i
     }
   }
 
-  const db = new DatabaseSync(join(dataDir, 'externalities.sqlite'));
+  const db = openMain();
   try {
+    const own = db.prepare('SELECT id FROM tokens WHERE email = ?').get(HOLDER).id;
     db.prepare(`INSERT INTO externalities
-      (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words, token_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       'other-org-1', 'another-org', 'org-atlas', 'org-item', 'not ours', 'someone else', 'elsewhere',
-      'open', new Date().toISOString(), null, null);
+      'open', new Date().toISOString(), null, null, own);
   } finally {
     db.close();
   }
   for (const headers of [read(), h]) {
     const r = await call('GET', '/inventory', { headers });
     assert.equal(r.status, 200);
-    assert.ok(!r.json.records.some((rec) => rec.id === 'other-org-1'), 'absent from a scope-all inventory');
+    assert.ok(!r.json.records.some((rec) => rec.id === 'other-org-1'), 'absent from the inventory');
     assert.ok(r.json.records.every((rec) => rec['org-slug'] === ORG));
   }
   for (const [method, path, opts] of routes('other-org-1').slice(1)) {
@@ -523,61 +436,6 @@ test('org slug: optional on a token call, refused when it differs; another org i
     assert.equal(r.status, 404, `${method} ${path}`);
     assert.equal(r.json.error, 'unknown id');
   }
-});
-
-test('scope: a token sees and changes only the atlases it names', async () => {
-  const item = 'scope-item';
-  const ida = await addOne('a', item);
-  const idb = await addOne('b', item);
-  const idn = await addOne('none', item);
-  const tokA = (await mintToken('a')).token;
-  const tokAN = (await mintToken('a,none')).token;
-
-  let r = await call('GET', '/status', { headers: byToken(tokA, 'a', item), params: { id: ida } });
-  assert.equal(r.status, 200);
-  assert.equal(r.json.record.id, ida);
-  r = await call('POST', '/update', { headers: byToken(tokA, 'a', item), body: { id: ida, what: 'changed within scope' } });
-  assert.equal(r.status, 200);
-  assert.equal(r.json.record.what, 'changed within scope');
-  for (const [atlas, id] of [['b', idb], ['none', idn]]) {
-    r = await call('GET', '/status', { headers: byToken(tokA, atlas, item), params: { id } });
-    assert.equal(r.status, 404, `status under ${atlas}`);
-    assert.equal(r.json.error, 'unknown id');
-    r = await call('POST', '/update', { headers: byToken(tokA, atlas, item), body: { id, what: 'out of scope' } });
-    assert.equal(r.status, 404, `update under ${atlas}`);
-    assert.equal(r.json.error, 'unknown id');
-  }
-  r = await call('GET', '/status', { headers: byToken(tokAN, 'none', item), params: { id: idn } });
-  assert.equal(r.status, 200, 'none in a scope sees records under none');
-
-  const list = async (token, atlas, itm) => {
-    const res = await call('GET', '/inventory', { headers: byToken(token, atlas, itm) });
-    assert.equal(res.status, 200);
-    return res.json.records;
-  };
-  const onlyA = await list(tokA);
-  assert.ok(onlyA.some((rec) => rec.id === ida));
-  assert.ok(onlyA.every((rec) => rec['atlas-slug'] === 'a'), 'scope a lists only a');
-  const aNone = await list(tokAN);
-  assert.ok(aNone.every((rec) => ['a', 'none'].includes(rec['atlas-slug'])), 'scope a,none lists only a and none');
-  const aNoneIds = aNone.map((rec) => rec.id);
-  assert.ok(aNoneIds.includes(ida) && aNoneIds.includes(idn) && !aNoneIds.includes(idb));
-  const everything = (await list(TOKEN)).map((rec) => rec.id);
-  for (const id of [ida, idb, idn]) assert.ok(everything.includes(id), 'scope all lists all three');
-
-  // The atlas and item slugs keep their meaning within the scope.
-  for (const [atlas, itm, reason] of [[null, item, 'atlas-slug is required'], ['a', null, 'item-slug is required']]) {
-    r = await call('GET', '/status', { headers: byToken(tokA, atlas, itm), params: { id: ida } });
-    assert.equal(r.status, 400);
-    assert.equal(r.json.error, reason);
-    r = await call('POST', '/update', { headers: byToken(tokA, atlas, itm), body: { id: ida, what: 'x' } });
-    assert.equal(r.status, 400);
-    assert.equal(r.json.error, reason);
-  }
-  assert.deepEqual(idsOf(await list(tokAN, 'none', item)), [idn]);
-  assert.deepEqual(idsOf(await list(tokAN, null, item)), [ida, idn].sort());
-  assert.deepEqual(idsOf(await list(TOKEN, null, item)), [ida, idb, idn].sort());
-  assert.deepEqual(await list(tokA, 'b', null), []);
 });
 
 test('inventory q: a substring of what, who-acts or how-observed, wildcards literal', async () => {
@@ -593,7 +451,7 @@ test('inventory q: a substring of what, who-acts or how-observed, wildcards lite
   await addOne('b', item, rec('key axb here'));
   const bsl = await addOne('a', item, rec('path a\\b here'));
   await addOne('a', item, rec('path ab here'));
-  const tokA = (await mintToken('a')).token;
+  const other = (await newToken()).token;
   const find = async (token, params, atlas) => {
     const r = await call('GET', '/inventory', { headers: byToken(token, atlas, null), params });
     assert.equal(r.status, 200, JSON.stringify(params));
@@ -603,8 +461,7 @@ test('inventory q: a substring of what, who-acts or how-observed, wildcards lite
   assert.deepEqual(await find(TOKEN, { q: 'quokka' }), [qa1, qb2].sort(), 'what, any case');
   assert.deepEqual(await find(TOKEN, { q: 'WOMB' }), [qa2], 'who-acts');
   assert.deepEqual(await find(TOKEN, { q: 'tYpU' }), [qb1], 'how-observed');
-  assert.deepEqual(await find(tokA, { q: 'quokka' }), [qa1], 'within the scope');
-  assert.deepEqual(await find(tokA, { q: 'platypus' }), []);
+  assert.deepEqual(await find(other, { q: 'quokka' }), [], "another token's inventory holds none of them");
 
   const r = await call('POST', '/update', { headers: read('a', item), body: { id: qa1, state: 'cleared', 'cleared-words': 'seen' } });
   assert.equal(r.status, 200);
@@ -625,55 +482,7 @@ test('inventory q: a substring of what, who-acts or how-observed, wildcards lite
   assert.ok(space.json.records.length > 0);
 });
 
-// The two tests below are the only place the old navigation-slug names remain in this file.
-
-test('the old column is renamed at start and the rows kept', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'externality-tracker-old-'));
-  const old = new DatabaseSync(join(dir, 'externalities.sqlite'));
-  old.exec(`CREATE TABLE IF NOT EXISTS externalities (
-    id TEXT PRIMARY KEY, org TEXT, nav TEXT, item TEXT, what TEXT,
-    who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
-    cleared_date TEXT, cleared_words TEXT)`);
-  old.prepare(`INSERT INTO externalities
-    (id, org, nav, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    'old-1', ORG, 'old-nav', 'old-item', 'kept', 'someone', 'somehow', 'open', '2026-10-12T00:00:00.000Z', null, null);
-  old.close();
-  const expectRecord = (rec) => {
-    assert.equal(rec.id, 'old-1');
-    assert.equal(rec['atlas-slug'], 'old-nav');
-    assert.equal(rec['item-slug'], 'old-item');
-    assert.equal(rec.what, 'kept');
-    assert.equal(rec['who-acts'], 'someone');
-    assert.equal(rec['how-observed'], 'somehow');
-    assert.equal(rec.state, 'open');
-    assert.equal(rec['set-date'], '2026-10-12T00:00:00.000Z');
-    assert.equal('nav-slug' in rec, false);
-  };
-  for (const start of [1, 2]) {
-    const s = createServer({ ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, DATA_DIR: dir });
-    await new Promise((resolve) => s.listen(0, '127.0.0.1', resolve));
-    const b = `http://127.0.0.1:${s.address().port}`;
-    const minted = await fetch(`${b}/tokens`, {
-      method: 'POST', headers: { ...auth(), 'content-type': 'application/json' }, body: JSON.stringify({ scope: 'all' }),
-    });
-    assert.equal(minted.status, 201, `start ${start}`);
-    const h = byToken((await minted.json()).token, 'old-nav', 'old-item');
-    const inv = await (await fetch(`${b}/inventory`, { headers: h })).json();
-    assert.equal(inv.records.length, 1, `start ${start}`);
-    expectRecord(inv.records[0]);
-    const st = await (await fetch(`${b}/status?id=old-1`, { headers: h })).json();
-    expectRecord(st.record);
-    await new Promise((resolve) => s.close(resolve));
-  }
-  const after2 = new DatabaseSync(join(dir, 'externalities.sqlite'));
-  const columns = after2.prepare('PRAGMA table_info(externalities)').all().map((c) => c.name);
-  after2.close();
-  assert.ok(columns.includes('atlas') && !columns.includes('nav'), columns.join(','));
-  // the directory is left in place on purpose (the item's concern C1, option (a))
-});
-
-test('the old header alone is refused', async () => {
+test('the old navigation header alone is refused', async () => {
   const r = await call('POST', '/add', { headers: auth(null, 'i', { 'X-Nav-Slug': 'n' }), body: BODY });
   assert.equal(r.status, 400);
   assert.equal(r.json.error, 'atlas-slug is required');
@@ -682,9 +491,472 @@ test('the old header alone is refused', async () => {
   assert.equal(p.json.error, 'atlas-slug is required');
 });
 
-// Delivery: every add re-sent once to the URL of each in-scope token. The one test server delivers every add to
-// every in-scope token with a URL, so each test mints its own token with its own receiver under its own atlas,
-// and counts only the requests carrying its own record's id. No assertion message below carries a token.
+test('the limit: a count ends one window after its first ask, per caller and for the service', () => {
+  assert.deepEqual(LIMITS, { perCaller: 5, total: 60, windowMs: 60_000 });
+  let t = 0;
+  const may = makeLimiter({ perCaller: 2, total: 3, windowMs: 1000 }, () => t);
+  assert.equal(may('a'), true);
+  assert.equal(may('a'), true);
+  assert.equal(may('a'), false, "over the caller's number");
+  assert.equal(may('b'), false, "b's first, over the service's number");
+  t = 999;
+  assert.equal(may('b'), false, 'both windows still open');
+  t = 1000;
+  assert.equal(may('a'), true, 'a window ends one window after its first ask');
+});
+
+test('the limit: posts over the service-wide number, from many callers, add no caller window; ended windows are swept', () => {
+  let t = 0;
+  const may = makeLimiter({ perCaller: 5, total: 3, windowMs: 1000 }, () => t);
+  for (const caller of ['a', 'b', 'c']) assert.equal(may(caller), true);
+  assert.equal(may.callers(), 3);
+  for (let i = 0; i < 500; i++) assert.equal(may(`198.51.100.${i}`), false, 'over the service-wide number');
+  assert.equal(may.callers(), 3, 'no window made or kept for a refused caller');
+  t = 999;
+  assert.equal(may('d'), false, 'every post counted toward the service, the refused ones included');
+  assert.equal(may.callers(), 3);
+  t = 1000;
+  assert.equal(may('e'), true, 'a new window for the service');
+  assert.equal(may.callers(), 1, "the ended callers' windows are swept");
+});
+
+// Asking for a token, in the service's own tests against a local service.
+
+test('A1: an authorized address gets 201 and a token; a second ask gets 200 and the same token; no credential is sent', async () => {
+  await listEmail(base, 'first@example.org');
+  const one = await call('POST', '/tokens', { body: { email: 'first@example.org' } });
+  assert.equal(one.status, 201, one.json && one.json.error);
+  assert.deepEqual(Object.keys(one.json), ['token', 'url', 'date']);
+  assert.ok(BASE64URL_32_BYTES.test(one.json.token), 'the token is 32 bytes as base64url');
+  assert.equal(one.json.url, null);
+  assert.match(one.json.date, ISO);
+  const two = await call('POST', '/tokens', { body: { email: 'first@example.org' } });
+  assert.equal(two.status, 200, two.json && two.json.error);
+  assert.deepEqual(Object.keys(two.json), ['token', 'url', 'date']);
+  assert.ok(two.json.token === one.json.token, 'the same token');
+  assert.equal(two.json.date, one.json.date);
+  assert.equal((await call('GET', '/token', { headers: bearer(one.json.token) })).status, 200, 'the token opens a token route');
+  const db = openMain();
+  try {
+    const rows = db.prepare('SELECT email, token FROM tokens WHERE email = ?').all('first@example.org');
+    assert.equal(rows.length, 1, 'one token, stored next to its address');
+    assert.ok(rows[0].token === one.json.token, 'the stored token is the one returned');
+  } finally {
+    db.close();
+  }
+});
+
+test('A2: an unlisted address, a deactivated one and a variation of each get the same status and body', async () => {
+  await listEmail(base, 'gone@example.org');
+  await tokenAt(base, 'gone@example.org');
+  await activate(base, 'gone@example.org', false);
+  for (const email of ['nobody@example.org', 'nobody+x@example.org', 'gone@example.org', 'gone+x@example.org', 'gone+@example.org']) {
+    assert.deepEqual(await askAt(base, email), REFUSED, email);
+  }
+});
+
+test('A3: an address asked in capitals, with spaces around it, gets its token', async () => {
+  await listEmail(base, 'caps@example.org');
+  const first = await askAt(base, '  CAPS@Example.ORG \t');
+  assert.equal(first.status, 201, first.json && first.json.error);
+  const plain = await askAt(base, 'caps@example.org');
+  assert.equal(plain.status, 200);
+  assert.ok(plain.json.token === first.json.token, 'the same token as the plain address');
+  const loud = await askAt(base, ' Caps+Work@EXAMPLE.org ');
+  assert.equal(loud.status, 201, loud.json && loud.json.error);
+  const quiet = await askAt(base, 'caps+work@example.org');
+  assert.equal(quiet.status, 200);
+  assert.ok(quiet.json.token === loud.json.token, 'a variation in capitals is the same variation');
+});
+
+test('A4: an ask naming a URL stores it, another replaces it, a bare ask keeps it, null clears it; the token never changes', async () => {
+  const email = 'forward@example.org';
+  await listEmail(base, email);
+  const u1 = 'http://127.0.0.1:1/hook?x=1&y=two';
+  const u2 = 'https://example.org/second';
+  const urlOf = async (token) => (await call('GET', '/token', { headers: bearer(token) })).json.url;
+  let r = await askAt(base, email, { url: u1 });
+  assert.equal(r.status, 201, r.json && r.json.error);
+  assert.equal(r.json.url, u1);
+  const token = r.json.token;
+  assert.equal(await urlOf(token), u1);
+  for (const [label, extra, code, url] of [
+    ['another URL', { url: u2 }, 200, u2],
+    ['a bare ask', {}, 200, u2],
+    ['null', { url: null }, 200, null],
+    ['a bare ask after null', {}, 200, null],
+  ]) {
+    r = await askAt(base, email, extra);
+    assert.equal(r.status, code, label);
+    assert.equal(r.json.url, url, label);
+    assert.ok(r.json.token === token, `${label}: the token is unchanged`);
+    assert.equal(await urlOf(token), url, `${label}: as stored`);
+  }
+});
+
+test('A5: a body with no email, and one with a url that is no web address, each answer 400', async () => {
+  for (const body of [{}, { email: '' }, { email: '   ' }, { email: 42 }, { email: [HOLDER] }, { email: null }, { url: 'https://example.org' }]) {
+    const r = await call('POST', '/tokens', { body });
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.equal(r.json.error, 'email must be a non-empty string');
+  }
+  for (const url of ['ftp://x', 'not a url', 42, '', '/relative', { href: 'https://example.org' }, false]) {
+    const r = await askAt(base, HOLDER, { url });
+    assert.equal(r.status, 400, JSON.stringify(url));
+    assert.equal(r.json.error, URL_REASON);
+  }
+  let r = await call('POST', '/tokens', { body: [1] });
+  assert.equal(r.status, 400);
+  assert.equal(r.json.error, 'body must be a JSON object');
+  r = await call('POST', '/tokens', { raw: '{not json' });
+  assert.equal(r.status, 400);
+  assert.equal(r.json.error, 'body is not valid JSON');
+  assert.equal((await call('GET', '/token', { headers: read() })).json.url, null, 'nothing was stored by a refused ask');
+});
+
+// Variations and the limit, in the same tests.
+
+test('A6: a variation of an authorized address, never added, gets 201 and a token', async () => {
+  await listEmail(base, 'plus@example.org');
+  const r = await askAt(base, 'plus+anything@example.org');
+  assert.equal(r.status, 201, r.json && r.json.error);
+  assert.ok(BASE64URL_32_BYTES.test(r.json.token));
+  const db = openMain();
+  try {
+    assert.equal(db.prepare("SELECT count(*) AS n FROM authorized_emails WHERE email LIKE 'plus+%'").get().n, 0, 'the variation is not listed');
+    const row = db.prepare('SELECT authorized_email FROM tokens WHERE email = ?').get('plus+anything@example.org');
+    const listed = db.prepare('SELECT id FROM authorized_emails WHERE email = ?').get('plus@example.org');
+    assert.equal(row.authorized_email, listed.id, 'the token row is keyed to its authorized address');
+  } finally {
+    db.close();
+  }
+});
+
+test("A7: a variation's token differs from its authorized address's and from a second variation's; each returns unchanged", async () => {
+  await listEmail(base, 'split@example.org');
+  const emails = ['split@example.org', 'split+one@example.org', 'split+two@example.org'];
+  const first = [];
+  for (const email of emails) {
+    const r = await askAt(base, email);
+    assert.equal(r.status, 201, email);
+    first.push(r.json.token);
+  }
+  assert.equal(new Set(first).size, 3, 'three different tokens');
+  for (const [i, email] of emails.entries()) {
+    const r = await askAt(base, email);
+    assert.equal(r.status, 200, email);
+    assert.ok(r.json.token === first[i], `${email}: unchanged`);
+  }
+});
+
+test('A8: a further variation gets a token however many exist, one with no text after its "+" among them', async () => {
+  await listEmail(base, 'crowd@example.org');
+  const seen = new Set();
+  for (const tag of ['', ...Array.from({ length: 40 }, (_, i) => `n${i}`)]) {
+    const r = await askAt(base, `crowd+${tag}@example.org`);
+    assert.equal(r.status, 201, `crowd+${tag}`);
+    seen.add(r.json.token);
+  }
+  assert.equal(seen.size, 41, 'each variation its own token');
+  const more = await askAt(base, 'crowd+one.more@example.org');
+  assert.equal(more.status, 201, 'one more after them all');
+});
+
+// A server of its own on LIMITS, the service's own numbers.
+async function limitServer() {
+  const s = createServer({ ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, DATA_DIR: mkdtempSync(join(dataDir, 'limit-')) });
+  const b = await listenOn(s);
+  return { base: b, close: async () => { s.closeAllConnections(); await new Promise((resolve) => s.close(resolve)); } };
+}
+
+test('A9: the sixth post from one caller within a minute gets 429, whatever the five before it answered', async () => {
+  const s = await limitServer();
+  try {
+    await listEmail(s.base, 'limit@example.org');
+    const from = { 'X-Real-IP': '203.0.113.9' };
+    const answers = [];
+    for (const opts of [
+      { body: { email: 'limit@example.org' } },
+      { body: { email: 'nobody@example.org' } },
+      { body: {} },
+      { body: { email: 'limit@example.org' } },
+      { raw: '{not json' },
+    ]) {
+      answers.push((await request(s.base, 'POST', '/tokens', { headers: from, ...opts })).status);
+    }
+    assert.deepEqual(answers, [201, 401, 400, 200, 400]);
+    const sixth = await request(s.base, 'POST', '/tokens', { headers: from, body: { email: 'limit@example.org' } });
+    assert.deepEqual(sixth, { status: 429, json: { error: 'too many asks' } });
+    const another = await request(s.base, 'POST', '/tokens', { headers: { 'X-Real-IP': '203.0.113.10' }, body: { email: 'limit@example.org' } });
+    assert.equal(another.status, 200, "another caller is not held by this one's count");
+    // Without X-Real-IP the connection's own address is the caller.
+    for (let i = 0; i < 5; i++) {
+      assert.equal((await request(s.base, 'POST', '/tokens', { body: { email: 'nobody@example.org' } })).status, 401);
+    }
+    const last = await request(s.base, 'POST', '/tokens', { body: { email: 'limit@example.org' } });
+    assert.deepEqual(last, { status: 429, json: { error: 'too many asks' } });
+  } finally {
+    await s.close();
+  }
+});
+
+test('A10: the sixty-first post within a minute, from many callers, gets 429', async () => {
+  const s = await limitServer();
+  try {
+    await listEmail(s.base, 'busy@example.org');
+    for (let caller = 1; caller <= 12; caller++) {
+      for (let i = 0; i < 5; i++) {
+        const email = i % 2 === 0 ? 'busy@example.org' : 'nobody@example.org';
+        const r = await request(s.base, 'POST', '/tokens', { headers: { 'X-Real-IP': `198.51.100.${caller}` }, body: { email } });
+        assert.notEqual(r.status, 429, `post ${(caller - 1) * 5 + i + 1}`);
+      }
+    }
+    const r = await request(s.base, 'POST', '/tokens', { headers: { 'X-Real-IP': '198.51.100.200' }, body: { email: 'busy@example.org' } });
+    assert.deepEqual(r, { status: 429, json: { error: 'too many asks' } }, 'the sixty-first, from a caller of its first ask');
+  } finally {
+    await s.close();
+  }
+});
+
+// The email list, in the same tests.
+
+test('A11: with the admin token, adding a new address answers 201; it gets a token at its first ask; a url sent with the add is stored nowhere', async () => {
+  const r = await call('POST', '/emails', { headers: asAdmin, body: { email: 'added@example.org', url: 'http://127.0.0.1:1/never', active: false, token: 'x' } });
+  assert.deepEqual(r, { status: 201, json: { email: 'added@example.org', active: true } });
+  const t = await askAt(base, 'added@example.org');
+  assert.equal(t.status, 201, t.json && t.json.error);
+  assert.equal(t.json.url, null, 'the url of the add is not the token\'s');
+  const db = openMain();
+  try {
+    assert.deepEqual(db.prepare('PRAGMA table_info(authorized_emails)').all().map((c) => c.name), ['id', 'email', 'active']);
+    assert.equal(db.prepare('SELECT active FROM authorized_emails WHERE email = ?').get('added@example.org').active, 1);
+    assert.equal(db.prepare('SELECT url FROM tokens WHERE email = ?').get('added@example.org').url, null);
+  } finally {
+    db.close();
+  }
+});
+
+test('A12: adding a known address answers 200 and changes nothing, a deactivated one staying inactive', async () => {
+  const add = (email) => call('POST', '/emails', { headers: asAdmin, body: { email } });
+  assert.deepEqual(await add('known@example.org'), { status: 201, json: { email: 'known@example.org', active: true } });
+  assert.deepEqual(await add('known@example.org'), { status: 200, json: { email: 'known@example.org', active: true } });
+  assert.deepEqual(await add('  KNOWN@Example.ORG '), { status: 200, json: { email: 'known@example.org', active: true } }, 'trimmed and lowered');
+  await activate(base, 'known@example.org', false);
+  assert.deepEqual(await add('known@example.org'), { status: 200, json: { email: 'known@example.org', active: false } });
+  assert.deepEqual(await askAt(base, 'known@example.org'), REFUSED, 'still inactive');
+  const db = openMain();
+  try {
+    assert.deepEqual(db.prepare('SELECT active FROM authorized_emails WHERE email = ?').all('known@example.org').map((r) => r.active), [0], 'one row, inactive');
+  } finally {
+    db.close();
+  }
+});
+
+test("A13: deactivating an address refuses its token, its asks and its variations' with no restart; activating restores the same tokens and their records", async () => {
+  await listEmail(base, 'toggle@example.org');
+  const plain = (await tokenAt(base, 'toggle@example.org')).token;
+  const varied = (await tokenAt(base, 'toggle+v@example.org')).token;
+  const ids = [];
+  for (const token of [plain, varied]) {
+    const r = await call('POST', '/add', { headers: byToken(token, 'tg', 'tg-item'), body: BODY });
+    assert.equal(r.status, 201, r.json && r.json.error);
+    ids.push(r.json.id);
+  }
+  await activate(base, 'toggle@example.org', false);
+  for (const token of [plain, varied]) {
+    for (const [method, path, opts] of [['GET', '/token', {}], ['GET', '/inventory', {}], ['POST', '/add', { body: BODY }],
+      ['GET', '/status', { params: { id: ids[0] } }]]) {
+      const r = await call(method, path, { ...opts, headers: byToken(token, 'tg', 'tg-item') });
+      assert.deepEqual(r, { status: 401, json: { error: 'unknown token' } }, `${method} ${path}`);
+    }
+  }
+  for (const email of ['toggle@example.org', 'toggle+v@example.org', 'toggle+new@example.org']) {
+    assert.deepEqual(await askAt(base, email), REFUSED, email);
+  }
+  await activate(base, 'toggle@example.org', true);
+  for (const [i, [email, token]] of [['toggle@example.org', plain], ['toggle+v@example.org', varied]].entries()) {
+    const inv = await call('GET', '/inventory', { headers: byToken(token) });
+    assert.equal(inv.status, 200, email);
+    assert.deepEqual(idsOf(inv.json.records), [ids[i]], `${email}: its record is back`);
+    const again = await askAt(base, email);
+    assert.equal(again.status, 200, email);
+    assert.ok(again.json.token === token, `${email}: the same token`);
+  }
+});
+
+test('A14: an unknown address on the activate endpoint answers 404; a malformed address, one holding a "+" among them, answers 400 on both', async () => {
+  const r = await call('POST', '/emails/active', { headers: asAdmin, body: { email: 'unknown@example.org', active: false } });
+  assert.deepEqual(r, { status: 404, json: { error: 'unknown email' } });
+  for (const email of ['no-at', 'two@@example.org', 'a@b@example.org', '@example.org', 'name@', 'sp ace@example.org',
+    'tab\t@example.org', 'plus+tag@example.org', '+@example.org', '', '   ', 42, null, undefined]) {
+    for (const path of ['/emails', '/emails/active']) {
+      const body = email === undefined ? { active: true } : { email, active: true };
+      const res = await call('POST', path, { headers: asAdmin, body });
+      assert.deepEqual(res, { status: 400, json: { error: ADDRESS_REASON } }, `${path} ${JSON.stringify(email)}`);
+    }
+  }
+  for (const active of ['true', 1, null, undefined]) {
+    const body = active === undefined ? { email: HOLDER } : { email: HOLDER, active };
+    const res = await call('POST', '/emails/active', { headers: asAdmin, body });
+    assert.deepEqual(res, { status: 400, json: { error: 'active must be true or false' } }, JSON.stringify(active));
+  }
+  for (const body of [[1], 'text']) {
+    assert.equal((await call('POST', '/emails', { headers: asAdmin, body })).status, 400);
+  }
+  const db = openMain();
+  try {
+    assert.equal(db.prepare("SELECT count(*) AS n FROM authorized_emails WHERE email LIKE '%+%' OR email LIKE '% %'").get().n, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test("A15: both admin endpoints answer 401 with no bearer, a wrong one and a holder's token", async () => {
+  for (const [path, body] of [['/emails', { email: 'locked@example.org' }], ['/emails/active', { email: HOLDER, active: false }]]) {
+    for (const [label, headers, reason] of [
+      ['no bearer', {}, 'admin token is required'],
+      ['another scheme', { 'Authorization': `Basic ${ADMIN}` }, 'admin token is required'],
+      ['a wrong one', bearer('wrong'), 'wrong admin token'],
+      ['a near one', bearer(ADMIN.slice(0, -1)), 'wrong admin token'],
+      ["a holder's token", bearer(TOKEN), 'wrong admin token'],
+      ['the old org key', { ...bearer(OLD_KEY), 'X-Org-Slug': ORG }, 'wrong admin token'],
+    ]) {
+      const r = await call('POST', path, { headers, body });
+      assert.deepEqual(r, { status: 401, json: { error: reason } }, `${path}: ${label}`);
+    }
+    const r = await call('POST', path, { raw: '{not json' });
+    assert.deepEqual(r, { status: 401, json: { error: 'admin token is required' } }, `${path}: the admin token comes before the body`);
+  }
+  assert.deepEqual(await askAt(base, 'locked@example.org'), REFUSED, 'nothing was added');
+  assert.equal((await call('GET', '/token', { headers: read() })).status, 200, 'nothing was deactivated');
+});
+
+// The admin token and every other call, in the same tests.
+
+// Starts the service as `npm start` would, with the given variables; resolves when it exits or once it listens (then it is
+// stopped). No variable here is printed.
+function launch(env) {
+  const child = spawn(process.execPath, ['src/server.js'], { cwd: ROOT, env: { PATH: process.env.PATH, PORT: '0', ...env } });
+  let out = '';
+  let err = '';
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => child.kill(), 10000);
+    child.stdout.on('data', (d) => {
+      out += d;
+      if (/listening/.test(out)) child.kill();
+    });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, out, err });
+    });
+  });
+}
+
+test('A17: the service refuses to start with ADMIN_TOKEN unset or malformed, and starts with EXTERNALITY_KEY unset', async () => {
+  assert.equal(loadAdminToken({ ADMIN_TOKEN: ADMIN }), ADMIN);
+  for (const bad of [undefined, '', 'a'.repeat(31), `${'a'.repeat(31)}.`, ` ${'a'.repeat(32)}`, `${'a'.repeat(31)}é`]) {
+    assert.throws(() => loadAdminToken(bad === undefined ? {} : { ADMIN_TOKEN: bad }), /ADMIN_TOKEN/, `${String(bad).length} characters`);
+    const r = await launch({ ORG_SLUG: ORG, DATA_DIR: mkdtempSync(join(dataDir, 'start-')), ...(bad === undefined ? {} : { ADMIN_TOKEN: bad }) });
+    assert.notEqual(r.code, null, 'exited on its own');
+    assert.notEqual(r.code, 0);
+    assert.match(r.err, /refusing to start: ADMIN_TOKEN/);
+    assert.doesNotMatch(r.out, /listening/);
+  }
+  const noOrg = await launch({ ADMIN_TOKEN: ADMIN, DATA_DIR: mkdtempSync(join(dataDir, 'start-')) });
+  assert.notEqual(noOrg.code, 0);
+  assert.match(noOrg.err, /refusing to start: ORG_SLUG/);
+  const ok = await launch({ ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, DATA_DIR: mkdtempSync(join(dataDir, 'start-')) });
+  assert.match(ok.out, /listening/, 'started with EXTERNALITY_KEY unset');
+  assert.equal(ok.signal, 'SIGTERM', 'stopped by the test, not exited');
+  assert.doesNotMatch(ok.err, /refusing/);
+});
+
+const TOKEN_ROUTES = (atlas, item) => [
+  ['POST', '/add', { body: BODY }],
+  ['POST', '/update', { body: { id: 'x', what: 'x' } }],
+  ['GET', '/status', { params: { id: 'x' } }],
+  ['GET', '/inventory', {}],
+  ['GET', '/token', {}],
+  ['GET', '/thirdparty', {}],
+].map(([method, path, opts]) => [method, path, { ...opts, slugs: { 'X-Atlas-Slug': atlas, 'X-Item-Slug': item } }]);
+
+test('A18: the admin token, sent as bearer, is refused by every route but the two admin endpoints', async () => {
+  for (const [method, path, { slugs, ...opts }] of TOKEN_ROUTES('a18', 'a18-item')) {
+    const r = await call(method, path, { ...opts, headers: { ...asAdmin, ...slugs } });
+    assert.deepEqual(r, { status: 401, json: { error: 'unknown token' } }, `${method} ${path}`);
+  }
+  for (const [method, path, opts] of [['POST', `/${PART}/notify`, { body: notice('feature/a18', 'open') }], ['GET', statusPath('feature/a18')]]) {
+    const r = await at(method, path, { ...opts, headers: asAdmin });
+    assert.deepEqual(r, { status: 401, json: { error: 'unknown token' } }, `${method} at an open address`);
+  }
+  assert.deepEqual(await askAt(base, 'a18@example.org', {}, asAdmin), REFUSED, 'the tokens endpoint reads no credential: the admin token opens nothing there');
+  assert.equal((await call('POST', '/emails', { headers: asAdmin, body: { email: 'a18@example.org' } })).status, 201, 'the admin endpoints take it');
+});
+
+test('A19: every route but POST /tokens, GET / and the admin endpoints answers 401 with no token, with X-Consumer-Token alone, and with the old org key as bearer', async () => {
+  const variants = (token) => [
+    ['no token', { 'X-Org-Slug': ORG }, 'token is required'],
+    ['X-Consumer-Token alone', { 'X-Consumer-Token': token }, 'token is required'],
+    ['the old org key as bearer', { 'X-Org-Slug': ORG, ...bearer(OLD_KEY) }, 'unknown token'],
+  ];
+  for (const [method, path, { slugs, ...opts }] of TOKEN_ROUTES('a19', 'a19-item')) {
+    for (const [label, headers, reason] of variants(TOKEN)) {
+      const r = await call(method, path, { ...opts, headers: { ...headers, ...slugs } });
+      assert.deepEqual(r, { status: 401, json: { error: reason } }, `${method} ${path}: ${label}`);
+    }
+  }
+  for (const [method, path, opts] of [['POST', `/${PART}/notify`, { body: notice('feature/a19', 'open') }], ['GET', statusPath('feature/a19')]]) {
+    for (const [label, headers, reason] of variants(PART_TOKEN)) {
+      const r = await at(method, path, { ...opts, headers });
+      assert.deepEqual(r, { status: 401, json: { error: reason } }, `${method} at an open address: ${label}`);
+    }
+  }
+  assert.deepEqual(await statusOf('feature/a19'), [], 'nothing was kept');
+});
+
+test('A20: GET / answers 200 with its four fields and no credential', async () => {
+  const r = await call('GET', '/');
+  assert.equal(r.status, 200);
+  assert.deepEqual(Object.keys(r.json).sort(), ['node', 'ok', 'service', 'started']);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.service, 'externality-tracker');
+  assert.equal(r.json.node, process.version);
+  assert.match(r.json.started, ISO);
+});
+
+test('A21: at an open address a wrong part answers 404; the right part with no token answers 401; with a token, the notice is kept', async () => {
+  const item = 'feature/a21';
+  let wrong = randomBytes(32).toString('base64url');
+  while (wrong === PART) wrong = randomBytes(32).toString('base64url');
+  for (const headers of [{}, bearer(PART_TOKEN)]) {
+    assert.deepEqual(await at('POST', `/${wrong}/notify`, { headers, body: notice(item, 'open') }), NOT_FOUND);
+    assert.deepEqual(await at('GET', `/${wrong}/status?item=${encodeURIComponent(item)}`, { headers }), NOT_FOUND);
+  }
+  for (const [label, headers, reason] of [
+    ['no token', {}, 'token is required'],
+    ['a made-up token', bearer('made-up'), 'unknown token'],
+    ['the old header', { 'X-Consumer-Token': PART_TOKEN }, 'token is required'],
+  ]) {
+    assert.deepEqual(await at('POST', `/${PART}/notify`, { headers, body: notice(item, 'open') }), { status: 401, json: { error: reason } }, `notify: ${label}`);
+    assert.deepEqual(await at('GET', statusPath(item), { headers }), { status: 401, json: { error: reason } }, `status: ${label}`);
+  }
+  const kept = await post(notice(item, 'open'));
+  assert.deepEqual(Object.keys(kept), ['id']);
+  assert.deepEqual(await statusOf(item), [notice(item, 'open')], 'kept once, the refused posts not at all');
+});
+
+test('A22: a token adds a record and reads the third-party outcome', async () => {
+  const t = (await newToken()).token;
+  const r = await call('POST', '/add', { headers: byToken(t, 'a22', 'a22-item'), body: BODY });
+  assert.equal(r.status, 201, r.json && r.json.error);
+  const o = await call('GET', '/thirdparty', { headers: bearer(t) });
+  assert.equal(o.status, 200, o.json && o.json.error);
+  assert.deepEqual(Object.keys(o.json).sort(), ['last-delivery-date', 'last-delivery-status']);
+});
+
+// Delivery: an add POSTed once to the URL of the token that made it. Each test asks its own token with its own receiver.
+// No assertion message below carries a token.
 
 const receivers = [];
 
@@ -752,8 +1024,8 @@ async function settled(token, done = (t) => t['last-delivery-date'] !== null) {
   return assert.fail('no delivery settled within 3 s');
 }
 
-async function addFull(atlas, item) {
-  const r = await call('POST', '/add', { headers: auth(atlas, item), body: BODY });
+async function addFull(atlas, item, token) {
+  const r = await call('POST', '/add', { headers: byToken(token, atlas, item), body: BODY });
   assert.equal(r.status, 201, JSON.stringify(r.json));
   return r.json;
 }
@@ -766,14 +1038,39 @@ const assertAddShape = (r) => {
   assert.equal(r.json.record.state, 'open');
 };
 
-const TOKEN_FIELDS = ['date', 'last-delivery-date', 'last-delivery-status', 'scope', 'url'];
+const TOKEN_FIELDS = ['date', 'last-delivery-date', 'last-delivery-status', 'url'];
 
-test('delivery: a scoped token with a URL receives the add once, JSON, no auth header, the inventory record', async () => {
+test("A23: a new record reaches its own token's URL once and no other token's; a token without a URL receives nothing", async () => {
+  const rxA = await receiver();
+  const rxB = await receiver();
+  const a = await newToken(rxA.url);
+  const b = await newToken(rxB.url);
+  const none = await newToken();
+  const added = await addFull('a23', 'a23-item', a.token);
+  const outcome = await settled(a.token);
+  assert.equal(outcome['last-delivery-status'], 200);
+  assert.match(outcome['last-delivery-date'], ISO);
+  await sleep(NEGATIVE_WAIT);
+  assert.equal(rxA.withId(added.id).length, 1, 'once, to its own token');
+  assert.equal(rxA.requests.length, 1);
+  assert.equal(rxB.requests.length, 0, "no other token's URL");
+  const quiet = await addFull('a23', 'a23-item', none.token);
+  await sleep(NEGATIVE_WAIT);
+  assert.equal(rxA.withId(quiet.id).length + rxB.withId(quiet.id).length, 0, 'a token without a URL sends nowhere');
+  assert.equal(rxA.requests.length + rxB.requests.length, 1);
+  for (const t of [b, none]) {
+    const rec = await tokenRecord(t.token);
+    assert.equal(rec['last-delivery-date'], null);
+    assert.equal(rec['last-delivery-status'], null);
+  }
+});
+
+test('delivery: a token with a URL receives its own add once, JSON, no auth header, the inventory record', async () => {
   const rx = await receiver();
-  const atlas = 'dlv-scoped';
-  const item = 'dlv-scoped-item';
-  const t = await mintToken(atlas, rx.url);
-  const added = await addFull(atlas, item);
+  const atlas = 'dlv-own';
+  const item = 'dlv-own-item';
+  const t = await newToken(rx.url);
+  const added = await addFull(atlas, item, t.token);
   const outcome = await settled(t.token);
   const got = rx.withId(added.id);
   assert.equal(got.length, 1, 'exactly one request with the id');
@@ -781,7 +1078,7 @@ test('delivery: a scoped token with a URL receives the add once, JSON, no auth h
   assert.equal('authorization' in got[0].headers, false, 'no auth header');
   const body = JSON.parse(got[0].body);
   assert.deepEqual(body, added.record, 'the add response record');
-  const inv = await call('GET', '/inventory', { headers: read(atlas, item) });
+  const inv = await call('GET', '/inventory', { headers: byToken(t.token, atlas, item) });
   assert.equal(inv.status, 200);
   const fromInventory = inv.json.records.find((rec) => rec.id === added.id);
   assert.ok(fromInventory, 'inventory lists the record');
@@ -790,34 +1087,10 @@ test('delivery: a scoped token with a URL receives the add once, JSON, no auth h
   assert.match(outcome['last-delivery-date'], ISO);
 });
 
-test('delivery: an add under another atlas does not reach the scoped token', async () => {
-  const rx = await receiver();
-  const t = await mintToken('dlv-mine', rx.url);
-  const added = await addFull('dlv-not-mine', 'dlv-not-mine-item');
-  await sleep(NEGATIVE_WAIT);
-  assert.equal(rx.withId(added.id).length, 0);
-  assert.equal(rx.requests.length, 0, 'the receiver was not called');
-  const rec = await tokenRecord(t.token);
-  assert.equal(rec['last-delivery-date'], null);
-  assert.equal(rec['last-delivery-status'], null);
-});
-
-test('delivery: a token of scope all with a URL receives the add', async () => {
-  const rx = await receiver();
-  const t = await mintToken('all', rx.url);
-  const added = await addFull('dlv-all-atlas', 'dlv-all-item');
-  const outcome = await settled(t.token);
-  assert.equal(rx.withId(added.id).length, 1);
-  assert.deepEqual(JSON.parse(rx.withId(added.id)[0].body), added.record);
-  assert.equal(outcome['last-delivery-status'], 200);
-  assert.match(outcome['last-delivery-date'], ISO);
-});
-
 test('delivery: a token without a URL stays at nulls', async () => {
-  const atlas = 'dlv-no-url';
-  const t = await mintToken(atlas);
+  const t = await newToken();
   assert.equal(t.url, null);
-  await addFull(atlas, 'dlv-no-url-item');
+  await addFull('dlv-no-url', 'dlv-no-url-item', t.token);
   await sleep(NEGATIVE_WAIT);
   const rec = await tokenRecord(t.token);
   assert.equal(rec.url, null);
@@ -827,9 +1100,8 @@ test('delivery: a token without a URL stays at nulls', async () => {
 
 test('delivery: a receiver answering 500 stores 500 and is called once', async () => {
   const rx = await receiver(500);
-  const atlas = 'dlv-500';
-  const t = await mintToken(atlas, rx.url);
-  const added = await addFull(atlas, 'dlv-500-item');
+  const t = await newToken(rx.url);
+  const added = await addFull('dlv-500', 'dlv-500-item', t.token);
   const outcome = await settled(t.token);
   assert.equal(outcome['last-delivery-status'], 500);
   assert.match(outcome['last-delivery-date'], ISO);
@@ -841,10 +1113,9 @@ test('delivery: a receiver answering 500 stores 500 and is called once', async (
 
 test('delivery: a never-answering receiver stores 0, connected once, the add answering 201 first', async () => {
   const rx = await receiver(null);
-  const atlas = 'dlv-silent';
-  const t = await mintToken(atlas, rx.url);
+  const t = await newToken(rx.url);
   const started = performance.now();
-  const r = await call('POST', '/add', { headers: auth(atlas, 'dlv-silent-item'), body: BODY });
+  const r = await call('POST', '/add', { headers: byToken(t.token, 'dlv-silent', 'dlv-silent-item'), body: BODY });
   const elapsed = performance.now() - started;
   assertAddShape(r);
   assert.ok(elapsed < DELIVERY_TIMEOUT, `the add answered in ${Math.round(elapsed)} ms, before the timeout`);
@@ -856,9 +1127,8 @@ test('delivery: a never-answering receiver stores 0, connected once, the add ans
 });
 
 test('delivery: a closed port stores 0 and the add answers 201 in shape', async () => {
-  const atlas = 'dlv-closed';
-  const t = await mintToken(atlas, await closedPortUrl());
-  const r = await call('POST', '/add', { headers: auth(atlas, 'dlv-closed-item'), body: BODY });
+  const t = await newToken(await closedPortUrl());
+  const r = await call('POST', '/add', { headers: byToken(t.token, 'dlv-closed', 'dlv-closed-item'), body: BODY });
   assertAddShape(r);
   const outcome = await settled(t.token);
   assert.equal(outcome['last-delivery-status'], 0);
@@ -869,8 +1139,8 @@ test('delivery: an update is not re-sent', async () => {
   const rx = await receiver();
   const atlas = 'dlv-update';
   const item = 'dlv-update-item';
-  const t = await mintToken(atlas, rx.url);
-  const added = await addFull(atlas, item);
+  const t = await newToken(rx.url);
+  const added = await addFull(atlas, item, t.token);
   await settled(t.token);
   assert.equal(rx.withId(added.id).length, 1);
   const u = await call('POST', '/update', { headers: byToken(t.token, atlas, item), body: { id: added.id, what: 'changed after the delivery' } });
@@ -883,13 +1153,12 @@ test('delivery: an update is not re-sent', async () => {
 
 test('delivery: a second add overwrites the outcome', async () => {
   const rx = await receiver(200);
-  const atlas = 'dlv-overwrite';
-  const t = await mintToken(atlas, rx.url);
-  const first = await addFull(atlas, 'dlv-overwrite-item');
+  const t = await newToken(rx.url);
+  const first = await addFull('dlv-overwrite', 'dlv-overwrite-item', t.token);
   const one = await settled(t.token);
   assert.equal(one['last-delivery-status'], 200);
   rx.status = 500;
-  const second = await addFull(atlas, 'dlv-overwrite-item');
+  const second = await addFull('dlv-overwrite', 'dlv-overwrite-item', t.token);
   const two = await settled(t.token, (x) => x['last-delivery-status'] === 500);
   assert.equal(two['last-delivery-status'], 500);
   assert.match(two['last-delivery-date'], ISO);
@@ -900,24 +1169,17 @@ test('delivery: a second add overwrites the outcome', async () => {
 
 test('GET /token: the token record without the token value, nulls before any delivery', async () => {
   const rx = await receiver();
-  const t = await mintToken('dlv-token-info', rx.url);
+  const t = await newToken(rx.url);
   const r = await call('GET', '/token', { headers: byToken(t.token) });
   assert.equal(r.status, 200, r.json && r.json.error);
   assert.deepEqual(Object.keys(r.json).sort(), TOKEN_FIELDS);
   assert.equal('token' in r.json, false, 'no token field');
-  assert.equal(r.json.scope, t.scope);
   assert.equal(r.json.url, t.url);
   assert.equal(r.json.url, rx.url);
   assert.equal(r.json.date, t.date);
   assert.equal(r.json['last-delivery-date'], null);
   assert.equal(r.json['last-delivery-status'], null);
   assert.equal(rx.requests.length, 0);
-});
-
-test('GET /token: the org key alone is refused with 401', async () => {
-  const r = await call('GET', '/token', { headers: auth() });
-  assert.equal(r.status, 401);
-  assert.equal(r.json.error, 'consumer token is required');
 });
 
 test('timeoutMs: 10000 by default, the variable when a positive integer, else 10000', () => {
@@ -929,8 +1191,8 @@ test('timeoutMs: 10000 by default, the variable when a positive integer, else 10
 });
 
 // The two open addresses, `/<part>/notify` and `/<part>/status`. The server above runs without ADDRESS_KEY, so its
-// addresses are off; a second server runs with a part, on its own data folder inside the first one's (removed with it).
-// No assertion message below carries the part.
+// addresses are off; a second server runs with a part, on its own data folder inside the first one's (removed with it),
+// HOLDER listed there with a token of its own. No assertion message below carries the part or a token.
 
 const PART = randomBytes(32).toString('base64url');
 const NOT_FOUND = { status: 404, json: { error: 'not found' } };
@@ -943,28 +1205,23 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 let partServer;
 let partBase;
 let partDir;
+let PART_TOKEN; // HOLDER's token on the server with the part
 
 before(async () => {
   partDir = join(dataDir, 'addresses');
-  partServer = createServer({ ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, ADDRESS_KEY: PART, DATA_DIR: partDir, DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT) });
-  await new Promise((resolve) => partServer.listen(0, '127.0.0.1', resolve));
-  partBase = `http://127.0.0.1:${partServer.address().port}`;
+  partServer = createServer({ ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, ADDRESS_KEY: PART, DATA_DIR: partDir, DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT) },
+    { limits: ROOMY });
+  partBase = await listenOn(partServer);
+  await listEmail(partBase, HOLDER);
+  PART_TOKEN = (await tokenAt(partBase, HOLDER)).token;
 });
 
 after(async () => {
   await new Promise((resolve) => partServer.close(resolve));
 });
 
-// A call to the server with the part; `raw` is sent as the body text when given.
-async function at(method, path, { headers = {}, body, raw } = {}) {
-  const init = { method, headers: { ...headers } };
-  if (raw !== undefined) init.body = raw;
-  else if (body !== undefined) init.body = JSON.stringify(body);
-  if (init.body !== undefined) init.headers['content-type'] = 'application/json';
-  const res = await fetch(new URL(path, partBase), init);
-  const text = await res.text();
-  return { status: res.status, json: text ? JSON.parse(text) : null };
-}
+// A call to the server with the part, under PART_TOKEN unless headers are given; `raw` is sent as the body text when given.
+const at = (method, path, { headers = bearer(PART_TOKEN), ...rest } = {}) => request(partBase, method, path, { headers, ...rest });
 
 const statusPath = (item) => `/${PART}/status${item === undefined ? '' : `?item=${encodeURIComponent(item)}`}`;
 
@@ -986,6 +1243,15 @@ const notice = (item, state, extra = {}) => ({
   'set-date': '2026-11-17T09:00:00.000Z', 'cleared-date': null, 'cleared-words': null, 'atlas': 'none', ...extra,
 });
 
+const partTokenId = () => {
+  const db = new DatabaseSync(join(partDir, 'externalities.sqlite'));
+  try {
+    return db.prepare('SELECT id FROM tokens WHERE email = ?').get(HOLDER).id;
+  } finally {
+    db.close();
+  }
+};
+
 test('ADDRESS_KEY: unset or empty is off; letters, digits, - and _, 32 or more is taken; anything else is refused', () => {
   assert.equal(loadAddressKey({}), '');
   assert.equal(loadAddressKey({ ADDRESS_KEY: '' }), '');
@@ -999,7 +1265,7 @@ test('the server refuses to start with a bad ADDRESS_KEY, naming it', () => {
   for (const part of ['a'.repeat(31), `${'a'.repeat(31)}.`]) {
     const r = spawnSync(process.execPath, ['src/server.js'], {
       cwd: ROOT,
-      env: { PATH: process.env.PATH, ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, ADDRESS_KEY: part, DATA_DIR: dataDir, PORT: '0' },
+      env: { PATH: process.env.PATH, ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, ADDRESS_KEY: part, DATA_DIR: dataDir, PORT: '0' },
       timeout: 10000,
       encoding: 'utf8',
     });
@@ -1011,15 +1277,17 @@ test('the server refuses to start with a bad ADDRESS_KEY, naming it', () => {
 
 test('addresses: off without ADDRESS_KEY, both answering as an unknown route', async () => {
   assert.deepEqual(await call('GET', '/elsewhere'), NOT_FOUND);
-  assert.deepEqual(await call('POST', `/${PART}/notify`, { body: notice('feature/off', 'open') }), NOT_FOUND);
-  assert.deepEqual(await call('GET', statusPath('feature/off')), NOT_FOUND);
+  for (const headers of [{}, read()]) {
+    assert.deepEqual(await call('POST', `/${PART}/notify`, { headers, body: notice('feature/off', 'open') }), NOT_FOUND);
+    assert.deepEqual(await call('GET', statusPath('feature/off'), { headers }), NOT_FOUND);
+  }
 });
 
 test('addresses: on with ADDRESS_KEY, both answer; the present routes still answer', async () => {
   assert.deepEqual(Object.keys(await post(notice('feature/on', 'open'))), ['id']);
   assert.equal((await statusOf('feature/on')).length, 1);
-  assert.equal((await at('GET', '/')).status, 200);
-  assert.deepEqual(await at('GET', '/inventory'), { status: 401, json: { error: 'consumer token is required' } });
+  assert.equal((await at('GET', '/', { headers: {} })).status, 200);
+  assert.deepEqual(await at('GET', '/inventory', { headers: {} }), { status: 401, json: { error: 'token is required' } });
 });
 
 test('addresses: a wrong part, another method or a near path answers as an unknown route', async () => {
@@ -1045,26 +1313,7 @@ test('addresses: a wrong part, another method or a near path answers as an unkno
   assert.deepEqual(await statusOf('feature/wrong'), [], 'nothing was kept');
 });
 
-test('addresses: no credential is read; one sent is ignored', async () => {
-  const item = 'feature/no-credential';
-  const variants = [{}, { 'Authorization': 'Bearer wrong', 'X-Consumer-Token': 'wrong', 'X-Org-Slug': 'another-org' },
-    { 'Authorization': `Bearer ${KEY}`, 'X-Org-Slug': ORG }];
-  for (const [i, headers] of variants.entries()) {
-    const r = await at('POST', `/${PART}/notify`, { headers, body: notice(item, 'open', { what: `posted ${i}` }) });
-    assert.equal(r.status, 201, `notice ${i}`);
-  }
-  const reads = [];
-  for (const headers of variants) {
-    const r = await at('GET', statusPath(item), { headers });
-    assert.equal(r.status, 200);
-    reads.push(r.json);
-  }
-  assert.equal(reads[0].length, 3);
-  assert.deepEqual(reads[1], reads[0]);
-  assert.deepEqual(reads[2], reads[0]);
-});
-
-test('notify: a kept notice answers 201 with its id alone; two notices, two ids; one row each', async () => {
+test('notify: a kept notice answers 201 with its id alone; two notices, two ids; one row each, under the token', async () => {
   const item = 'feature/ids';
   const one = await post(notice(item, 'open'));
   const two = await post(notice(item, 'open'));
@@ -1073,10 +1322,11 @@ test('notify: a kept notice answers 201 with its id alone; two notices, two ids;
     assert.match(r.id, UUID);
   }
   assert.notEqual(one.id, two.id);
+  const own = partTokenId();
   const db = new DatabaseSync(join(partDir, 'externalities.sqlite'));
   try {
     const columns = db.prepare('PRAGMA table_info(notices)').all().map((c) => c.name);
-    assert.deepEqual(columns, ['id', 'item', 'state', 'what', 'body', 'received']);
+    assert.deepEqual(columns, ['id', 'item', 'state', 'what', 'body', 'received', 'token_id']);
     const rows = db.prepare('SELECT * FROM notices WHERE item = ?').all(item);
     assert.deepEqual(rows.map((r) => r.id).sort(), [one.id, two.id].sort());
     for (const row of rows) {
@@ -1084,6 +1334,7 @@ test('notify: a kept notice answers 201 with its id alone; two notices, two ids;
       assert.equal(row.what, 'a vendor key is issued');
       assert.deepEqual(JSON.parse(row.body), notice(item, 'open'));
       assert.match(row.received, ISO);
+      assert.equal(row.token_id, own);
     }
   } finally {
     db.close();
@@ -1105,7 +1356,7 @@ test('notify: kept as sent, a record of only item, state and what, and one with 
 test('status: a body that does not survive a JavaScript round trip comes back as the very text sent', async () => {
   const raw = '{"item":"feature/n","state":"open","what":"w","n":12345678901234567890,"m":1e400,"dup":1,"dup":2}';
   assert.equal((await at('POST', `/${PART}/notify`, { raw })).status, 201);
-  const res = await fetch(new URL(statusPath('feature/n'), partBase));
+  const res = await fetch(new URL(statusPath('feature/n'), partBase), { headers: bearer(PART_TOKEN) });
   assert.equal(res.status, 200);
   const text = await res.text();
   assert.ok(text.includes('12345678901234567890'));
@@ -1162,11 +1413,12 @@ test('status: an open and a cleared notice both kept, newest first; the referenc
 
 test('status: rows received in one instant read the later-inserted first', async () => {
   const item = 'feature/same-instant';
+  const own = partTokenId();
   const db = new DatabaseSync(join(partDir, 'externalities.sqlite'));
   try {
-    const insert = db.prepare('INSERT INTO notices (id, item, state, what, body, received) VALUES (?, ?, ?, ?, ?, ?)');
+    const insert = db.prepare('INSERT INTO notices (id, item, state, what, body, received, token_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
     for (const [id, state] of [['z-first', 'open'], ['a-second', 'cleared']]) {
-      insert.run(id, item, state, 'w', JSON.stringify({ item, state, what: 'w', id }), '2026-11-17T09:00:00.000Z');
+      insert.run(id, item, state, 'w', JSON.stringify({ item, state, what: 'w', id }), '2026-11-17T09:00:00.000Z', own);
     }
   } finally {
     db.close();
@@ -1183,32 +1435,60 @@ test('status: an unknown reference is an empty list; a missing or empty one is r
 
 test('status: a record added by POST /add stays on inventory and is in no status read', async () => {
   const item = 'feature/old-kind';
-  const r = await at('POST', '/add', { headers: auth('none', item), body: BODY });
+  const r = await at('POST', '/add', { headers: byToken(PART_TOKEN, 'none', item), body: BODY });
   assert.equal(r.status, 201, JSON.stringify(r.json));
   assert.deepEqual(await statusOf(item), []);
-  const token = (await at('POST', '/tokens', { headers: auth(), body: { scope: 'all' } })).json.token;
-  const inv = await at('GET', '/inventory', { headers: byToken(token, 'none', item) });
+  const inv = await at('GET', '/inventory', { headers: byToken(PART_TOKEN, 'none', item) });
   assert.equal(inv.status, 200);
   assert.deepEqual(inv.json.records.map((rec) => rec.id), [r.json.id]);
 });
 
 test('notify: a notice reaches no token address', async () => {
   const rx = await receiver();
-  const m = await at('POST', '/tokens', { headers: auth(), body: { scope: 'all', url: rx.url } });
-  assert.equal(m.status, 201);
-  const added = await at('POST', '/add', { headers: auth('none', 'feature/no-delivery'), body: BODY });
+  const t = await tokenAt(partBase, 'holder+rx@example.org', { url: rx.url });
+  const added = await at('POST', '/add', { headers: byToken(t.token, 'none', 'feature/no-delivery'), body: BODY });
   assert.equal(added.status, 201);
   for (let i = 0; i < 60 && rx.requests.length === 0; i++) await sleep(50);
   assert.equal(rx.withId(added.json.id).length, 1, 'positive control: the add was delivered');
-  const kept = await post(notice('feature/no-delivery', 'open'));
+  const kept = await at('POST', `/${PART}/notify`, { headers: bearer(t.token), body: notice('feature/no-delivery', 'open') });
+  assert.equal(kept.status, 201);
   await sleep(NEGATIVE_WAIT);
   assert.equal(rx.requests.length, 1, 'the notice was not delivered');
-  assert.equal(rx.withId(kept.id).length, 0);
+  assert.equal(rx.withId(kept.json.id).length, 0);
+});
+
+test("A24: an authorized address's token and its variation's each add a record and send a notice; neither reads, lists or changes the other's", async () => {
+  await listEmail(partBase, 'pair@example.org');
+  const p = (await tokenAt(partBase, 'pair@example.org')).token;
+  const v = (await tokenAt(partBase, 'pair+v@example.org')).token;
+  const atlas = 'a24';
+  const item = 'feature/a24';
+  const ids = {};
+  const notices = {};
+  for (const [name, token] of [['p', p], ['v', v]]) {
+    const r = await at('POST', '/add', { headers: byToken(token, atlas, item), body: { ...BODY, what: `made by ${name}` } });
+    assert.equal(r.status, 201, r.json && r.json.error);
+    ids[name] = r.json.id;
+    notices[name] = notice(item, 'open', { what: `sent by ${name}` });
+    assert.equal((await at('POST', `/${PART}/notify`, { headers: bearer(token), body: notices[name] })).status, 201);
+  }
+  for (const [mine, other, token] of [['p', 'v', p], ['v', 'p', v]]) {
+    const h = byToken(token, atlas, item);
+    const inv = await at('GET', '/inventory', { headers: byToken(token) });
+    assert.deepEqual(idsOf(inv.json.records), [ids[mine]], `${mine} lists its own only`);
+    assert.deepEqual(await at('GET', '/status', { headers: h, params: { id: ids[other] } }), { status: 404, json: { error: 'unknown id' } }, `${mine} reads`);
+    assert.deepEqual(await at('POST', '/update', { headers: h, body: { id: ids[other], what: 'changed by the other' } }),
+      { status: 404, json: { error: 'unknown id' } }, `${mine} changes`);
+    assert.deepEqual((await at('GET', statusPath(item), { headers: bearer(token) })).json, [notices[mine]], `${mine} reads its own notices only`);
+    const own = await at('GET', '/status', { headers: h, params: { id: ids[mine] } });
+    assert.equal(own.json.record.what, `made by ${mine}`, `${mine}'s record unchanged`);
+  }
 });
 
 // The passing-on: a notice's `3rdparty-notice-url` posted to once, behind the guard. Every receiver here listens on
 // loopback, which the guard refuses, so a server that must post runs with THIRDPARTY_ALLOW=127.0.0.1; each test
-// starts its own, on its own data folder inside the first server's (removed with it). No assertion message carries a part.
+// starts its own, on its own data folder inside the first server's (removed with it), HOLDER listed there and its token
+// sent with every notice, status read and outcome read. No assertion message carries a part or a token.
 
 const TP = '3rdparty-notice-url';
 const OUTSIDE = '93.184.216.34';
@@ -1216,11 +1496,13 @@ const OUTSIDE = '93.184.216.34';
 // A server with its notice address on and the given THIRDPARTY_ALLOW (undefined: unset).
 async function tpServer(allow) {
   const part = randomBytes(32).toString('base64url');
-  const env = { ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, ADDRESS_KEY: part, DATA_DIR: mkdtempSync(join(dataDir, 'tp-')),
+  const env = { ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, ADDRESS_KEY: part, DATA_DIR: mkdtempSync(join(dataDir, 'tp-')),
     DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT), ...(allow === undefined ? {} : { THIRDPARTY_ALLOW: allow }) };
   const s = createServer(env);
-  await new Promise((resolve) => s.listen(0, '127.0.0.1', resolve));
-  const b = `http://127.0.0.1:${s.address().port}`;
+  const b = await listenOn(s);
+  await listEmail(b, HOLDER);
+  const token = (await tokenAt(b, HOLDER)).token;
+  const own = bearer(token);
   const req = async (method, path, { headers = {}, raw } = {}) => {
     const init = { method, headers: { ...headers } };
     if (raw !== undefined) { init.body = raw; init.headers['content-type'] = 'application/json'; }
@@ -1230,10 +1512,12 @@ async function tpServer(allow) {
   };
   return {
     req,
+    base: b,
+    token,
     notifyUrl: `${b}/${part}/notify`,
-    notify: (raw, headers) => req('POST', `/${part}/notify`, { raw, headers }),
-    statusOf: (item) => req('GET', `/${part}/status?item=${encodeURIComponent(item)}`),
-    outcome: () => req('GET', '/thirdparty', { headers: auth() }),
+    notify: (raw, headers) => req('POST', `/${part}/notify`, { raw, headers: { ...own, ...headers } }),
+    statusOf: (item) => req('GET', `/${part}/status?item=${encodeURIComponent(item)}`, { headers: own }),
+    outcome: () => req('GET', '/thirdparty', { headers: own }),
     close: async () => { s.closeAllConnections(); await new Promise((resolve) => s.close(resolve)); },
   };
 }
@@ -1278,7 +1562,8 @@ test('thirdparty: one post per opened and per cleared notice, the text as receiv
       `{ "state":"cleared","item":"feature/tp-post","what":"w","${TP}":"${rx.url}" ,"n":2.0 }`,
     ];
     for (const [i, raw] of texts.entries()) {
-      const r = await s.notify(raw, i === 1 ? { 'Authorization': 'Bearer notice-side-0123' } : {});
+      // every notice's own post carries the holder's token as its authorization header
+      const r = await s.notify(raw);
       assert.equal(r.status, 201, JSON.stringify(r.json));
       for (let k = 0; k < 60 && rx.requests.length <= i; k++) await sleep(50);
     }
@@ -1491,7 +1776,7 @@ test('the server refuses to start with a bad THIRDPARTY_ALLOW, naming it', () =>
   for (const allow of ['localhost', '999.1.1.1', '10.0.0.0/99']) {
     const r = spawnSync(process.execPath, ['src/server.js'], {
       cwd: ROOT,
-      env: { PATH: process.env.PATH, ORG_SLUG: ORG, EXTERNALITY_KEY: KEY, THIRDPARTY_ALLOW: allow, DATA_DIR: dataDir, PORT: '0' },
+      env: { PATH: process.env.PATH, ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, THIRDPARTY_ALLOW: allow, DATA_DIR: dataDir, PORT: '0' },
       timeout: 10000,
       encoding: 'utf8',
     });
@@ -1501,12 +1786,13 @@ test('the server refuses to start with a bad THIRDPARTY_ALLOW, naming it', () =>
   }
 });
 
-test('GET /thirdparty: refused without the org key; null at first, the latest outcome after, replaced by the next', async () => {
+test('GET /thirdparty: refused without a valid token; null at first, the latest outcome after, replaced by the next', async () => {
   const rx = await receiver(200);
   const s = await tpServer('127.0.0.1');
   try {
     for (const headers of [{}, { 'X-Org-Slug': ORG }, { 'X-Org-Slug': ORG, 'Authorization': 'Bearer wrong' },
-      { 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${KEY}` }, { 'X-Consumer-Token': TOKEN }]) {
+      { 'X-Org-Slug': ORG, 'Authorization': `Bearer ${OLD_KEY}` }, { 'X-Consumer-Token': s.token }, asAdmin,
+      { 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${s.token}` }]) {
       const r = await s.req('GET', '/thirdparty', { headers });
       assert.equal(r.status, 401);
       assert.equal(typeof r.json.error, 'string');
@@ -1534,12 +1820,12 @@ test('thirdparty: a notice with an address reaches no token address', async () =
   const tokenRx = await receiver();
   const s = await tpServer('127.0.0.1');
   try {
-    assert.equal((await s.req('POST', '/tokens', { headers: auth(), raw: JSON.stringify({ scope: 'all', url: tokenRx.url }) })).status, 201);
-    const added = await s.req('POST', '/add', { headers: auth('none', 'feature/tp-token'), raw: JSON.stringify(BODY) });
+    const t = await tokenAt(s.base, 'holder+rx@example.org', { url: tokenRx.url });
+    const added = await s.req('POST', '/add', { headers: byToken(t.token, 'none', 'feature/tp-token'), raw: JSON.stringify(BODY) });
     assert.equal(added.status, 201);
     for (let i = 0; i < 60 && tokenRx.requests.length === 0; i++) await sleep(50);
     assert.equal(tokenRx.withId(added.json.id).length, 1, 'positive control: the add was delivered');
-    assert.equal((await s.notify(tpNotice('feature/tp-token', 'open', third.url))).status, 201);
+    assert.equal((await s.notify(tpNotice('feature/tp-token', 'open', third.url), bearer(t.token))).status, 201);
     await tpSettled(s);
     await sleep(NEGATIVE_WAIT);
     assert.equal(third.requests.length, 1, 'the third party got the notice');
@@ -1591,17 +1877,18 @@ test('thirdparty: a notice carrying x-externality-passed-on, any value, is kept 
   }
 });
 
-test('thirdparty: a notice naming the service\'s own notice address is kept twice, the original and one copy, no more', async () => {
+// The passing-on sends no credential (src/thirdparty.js, unchanged), and the notice address now wants a token, so the
+// copy it posts to this service's own notice address is refused with 401 and the loop ends at the first step.
+test('thirdparty: a notice naming the service\'s own notice address is kept once; the copy, sent with no token, is refused 401, no more', async () => {
   const s = await tpServer('127.0.0.1');
   try {
     const item = 'feature/tp-self';
     assert.equal((await s.notify(tpNotice(item, 'open', s.notifyUrl))).status, 201);
-    for (let i = 0; i < 60 && (await s.statusOf(item)).json.length < 2; i++) await sleep(50);
+    assert.equal((await tpSettled(s))['last-delivery-status'], 401, 'the copy was posted and refused');
     await sleep(NEGATIVE_WAIT);
-    assert.equal((await s.statusOf(item)).json.length, 2, 'the original and one copy');
-    assert.equal((await tpSettled(s))['last-delivery-status'], 201, 'the copy was posted and kept');
+    assert.equal((await s.statusOf(item)).json.length, 1, 'the original only');
     await sleep(NEGATIVE_WAIT);
-    assert.equal((await s.statusOf(item)).json.length, 2, 'the count is stable');
+    assert.equal((await s.statusOf(item)).json.length, 1, 'the count is stable');
   } finally {
     await s.close();
   }
@@ -1665,4 +1952,217 @@ test('thirdparty: an exemption covers its own address family only', async () => 
   }
   assert.deepEqual(await resolveTarget('http://[::1]/x', { lookup: look, allow: parseAllow('127.0.0.0/8') }), { refused: true }, '::1 under 127.0.0.0/8');
   assert.equal((await resolveTarget('http://127.0.0.1/x', { lookup: look, allow: parseAllow('127.0.0.0/8') })).refused, false, 'the IPv4 entry still exempts');
+});
+
+// Whose records and the old data: the schema, the scope ignored, the old tables dropped once.
+
+test('A25: the schema names token_id on both tables as a foreign key to tokens, and tokens as keyed to authorized_emails; each table holds its named columns', () => {
+  const db = openMain();
+  try {
+    const fks = (table) => db.prepare(`PRAGMA foreign_key_list(${table})`).all().map((f) => [f.from, f.table, f.to]);
+    assert.deepEqual(fks('externalities'), [['token_id', 'tokens', 'id']]);
+    assert.deepEqual(fks('notices'), [['token_id', 'tokens', 'id']]);
+    assert.deepEqual(fks('tokens'), [['authorized_email', 'authorized_emails', 'id']]);
+    assert.deepEqual(fks('authorized_emails'), []);
+    const cols = (table) => db.prepare(`PRAGMA table_info(${table})`).all();
+    const names = (table) => cols(table).map((c) => c.name);
+    assert.deepEqual(names('authorized_emails'), ['id', 'email', 'active']);
+    assert.deepEqual(names('tokens'), ['id', 'email', 'token', 'authorized_email', 'url', 'date', 'last_delivery_date', 'last_delivery_status']);
+    for (const table of ['authorized_emails', 'tokens']) {
+      assert.deepEqual(cols(table).filter((c) => c.pk).map((c) => c.name), ['id'], `${table} is keyed by id`);
+    }
+    for (const table of ['externalities', 'notices']) {
+      const tokenId = cols(table).find((c) => c.name === 'token_id');
+      assert.ok(tokenId, `${table} holds token_id`);
+      assert.equal(tokenId.notnull, 1, `${table}.token_id is required`);
+    }
+    assert.deepEqual(names('notices'), ['id', 'item', 'state', 'what', 'body', 'received', 'token_id']);
+    const uniques = (table) => db.prepare(`PRAGMA index_list(${table})`).all().filter((i) => i.unique)
+      .flatMap((i) => db.prepare(`PRAGMA index_info(${JSON.stringify(i.name)})`).all().map((c) => c.name)).sort();
+    assert.deepEqual(uniques('authorized_emails'), ['email']);
+    assert.deepEqual(uniques('tokens'), ['email', 'token']);
+    const insertNotice = db.prepare('INSERT INTO notices (id, item, state, what, body, received, token_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    assert.throws(() => insertNotice.run('fk-none', 'i', 'open', 'w', '{}', 't', 999999999), /FOREIGN KEY/);
+    assert.throws(() => insertNotice.run('fk-null', 'i', 'open', 'w', '{}', 't', null), /NOT NULL/);
+  } finally {
+    db.close();
+  }
+});
+
+test('A26: POST /tokens ignores a scope; GET /token returns none', async () => {
+  const email = variation();
+  const r = await askAt(base, email, { scope: 'some-atlas' });
+  assert.equal(r.status, 201, r.json && r.json.error);
+  assert.deepEqual(Object.keys(r.json), ['token', 'url', 'date']);
+  const again = await askAt(base, email, { scope: 'all' });
+  assert.equal(again.status, 200);
+  assert.ok(again.json.token === r.json.token, 'the same token, whatever scope is sent');
+  const info = await call('GET', '/token', { headers: bearer(r.json.token) });
+  assert.deepEqual(Object.keys(info.json).sort(), TOKEN_FIELDS);
+  assert.equal('scope' in info.json, false);
+  const db = openMain();
+  try {
+    assert.ok(!db.prepare('PRAGMA table_info(tokens)').all().some((c) => c.name === 'scope'), 'no scope column');
+  } finally {
+    db.close();
+  }
+  const added = await addFull('an-atlas-not-named', 'a26-item', r.json.token);
+  const inv = await call('GET', '/inventory', { headers: byToken(r.json.token) });
+  assert.deepEqual(idsOf(inv.json.records), [added.id], 'records are the token\'s, under any atlas');
+});
+
+// A database in the shape the old code made: its tables and columns, a row in each.
+function oldDatabase(dir) {
+  const old = new DatabaseSync(join(dir, 'externalities.sqlite'));
+  try {
+    old.exec(`CREATE TABLE externalities (
+      id TEXT PRIMARY KEY, org TEXT, atlas TEXT, item TEXT, what TEXT,
+      who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
+      cleared_date TEXT, cleared_words TEXT)`);
+    old.exec('CREATE TABLE tokens (token TEXT PRIMARY KEY, scope TEXT, url TEXT, date TEXT, last_delivery_date TEXT, last_delivery_status INTEGER)');
+    old.exec('CREATE TABLE notices (id TEXT PRIMARY KEY, item TEXT, state TEXT, what TEXT, body TEXT, received TEXT)');
+    old.exec('CREATE TABLE thirdparty (id INTEGER PRIMARY KEY CHECK (id = 1), last_delivery_date TEXT, last_delivery_status INTEGER)');
+    old.prepare(`INSERT INTO externalities (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('old-1', ORG, 'old-atlas', 'old-item', 'kept before', 'someone', 'somehow', 'open',
+      '2026-10-12T00:00:00.000Z', null, null);
+    old.prepare('INSERT INTO tokens (token, scope, url, date) VALUES (?, ?, ?, ?)').run('old-token-value-0123456789', 'all', null, '2026-10-12T00:00:00.000Z');
+    old.prepare('INSERT INTO notices (id, item, state, what, body, received) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('old-n1', 'feature/old', 'open', 'w', '{"item":"feature/old","state":"open","what":"w"}', '2026-10-12T00:00:00.000Z');
+    old.prepare('INSERT INTO thirdparty (id, last_delivery_date, last_delivery_status) VALUES (1, ?, ?)').run('2026-11-01T00:00:00.000Z', 204);
+  } finally {
+    old.close();
+  }
+}
+
+// Starts a server on the folder, the lines it writes to the log at start caught.
+async function startOn(dir) {
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  let s;
+  try {
+    s = createServer({ ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, DATA_DIR: dir });
+  } finally {
+    console.log = log;
+  }
+  const b = await listenOn(s);
+  return { base: b, lines, close: async () => { s.closeAllConnections(); await new Promise((resolve) => s.close(resolve)); } };
+}
+
+test('A27: a database made by the old code opens under the new code with its records, notices and tokens gone and its third-party outcome kept', async () => {
+  const dir = mkdtempSync(join(dataDir, 'old-'));
+  oldDatabase(dir);
+  const s = await startOn(dir);
+  try {
+    assert.deepEqual(s.lines, [DROPPED], 'one line naming the three tables');
+    const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
+    try {
+      for (const table of ['externalities', 'notices', 'tokens', 'authorized_emails']) {
+        assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 0, `${table} is empty`);
+      }
+      assert.ok(!db.prepare('PRAGMA table_info(tokens)').all().some((c) => c.name === 'scope'), 'tokens made new');
+      for (const table of ['externalities', 'notices']) {
+        assert.ok(db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === 'token_id'), `${table} made new`);
+      }
+      assert.deepEqual({ ...db.prepare('SELECT * FROM thirdparty').get() },
+        { id: 1, last_delivery_date: '2026-11-01T00:00:00.000Z', last_delivery_status: 204 }, 'the third-party outcome is kept');
+    } finally {
+      db.close();
+    }
+    assert.deepEqual(await request(s.base, 'GET', '/inventory', { headers: bearer('old-token-value-0123456789') }),
+      { status: 401, json: { error: 'unknown token' } }, 'the old token opens nothing');
+    await listEmail(s.base, HOLDER);
+    const token = (await tokenAt(s.base, HOLDER)).token;
+    assert.deepEqual((await request(s.base, 'GET', '/thirdparty', { headers: bearer(token) })).json,
+      { 'last-delivery-date': '2026-11-01T00:00:00.000Z', 'last-delivery-status': 204 });
+    assert.deepEqual((await request(s.base, 'GET', '/inventory', { headers: bearer(token) })).json, { records: [] });
+  } finally {
+    await s.close();
+  }
+});
+
+test('the old shape without a tokens table: records and notices dropped once, the third-party outcome kept, records made after kept', async () => {
+  const dir = mkdtempSync(join(dataDir, 'old-'));
+  const old = new DatabaseSync(join(dir, 'externalities.sqlite'));
+  try {
+    old.exec(`CREATE TABLE externalities (
+      id TEXT PRIMARY KEY, org TEXT, atlas TEXT, item TEXT, what TEXT,
+      who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
+      cleared_date TEXT, cleared_words TEXT)`);
+    old.exec('CREATE TABLE notices (id TEXT PRIMARY KEY, item TEXT, state TEXT, what TEXT, body TEXT, received TEXT)');
+    old.exec('CREATE TABLE thirdparty (id INTEGER PRIMARY KEY CHECK (id = 1), last_delivery_date TEXT, last_delivery_status INTEGER)');
+    old.prepare(`INSERT INTO externalities (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('old-2', ORG, 'old-atlas', 'old-item', 'kept before', 'someone', 'somehow', 'open',
+      '2026-10-12T00:00:00.000Z', null, null);
+    old.prepare('INSERT INTO notices (id, item, state, what, body, received) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('old-n2', 'feature/old', 'open', 'w', '{"item":"feature/old","state":"open","what":"w"}', '2026-10-12T00:00:00.000Z');
+    old.prepare('INSERT INTO thirdparty (id, last_delivery_date, last_delivery_status) VALUES (1, ?, ?)').run('2026-11-02T00:00:00.000Z', 202);
+  } finally {
+    old.close();
+  }
+  let s = await startOn(dir);
+  let token;
+  let id;
+  try {
+    assert.deepEqual(s.lines, [DROPPED], 'the one line, once');
+    const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
+    try {
+      for (const table of ['externalities', 'notices', 'tokens']) {
+        assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 0, `${table} is empty`);
+      }
+      for (const table of ['externalities', 'notices']) {
+        assert.ok(db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === 'token_id'), `${table} made new`);
+      }
+      assert.equal(db.prepare('SELECT last_delivery_status AS s FROM thirdparty').get().s, 202, 'the third-party outcome is kept');
+    } finally {
+      db.close();
+    }
+    await listEmail(s.base, HOLDER);
+    token = (await tokenAt(s.base, HOLDER)).token;
+    const r = await request(s.base, 'POST', '/add', { headers: byToken(token, 'between', 'between-item'), body: BODY });
+    assert.equal(r.status, 201, r.json && r.json.error);
+    id = r.json.id;
+  } finally {
+    await s.close();
+  }
+  s = await startOn(dir);
+  try {
+    assert.deepEqual(s.lines, [], 'a second open drops nothing');
+    const inv = await request(s.base, 'GET', '/inventory', { headers: byToken(token) });
+    assert.equal(inv.status, 200);
+    assert.deepEqual(idsOf(inv.json.records), [id], 'the record made in between is kept');
+    assert.deepEqual((await request(s.base, 'GET', '/thirdparty', { headers: bearer(token) })).json,
+      { 'last-delivery-date': '2026-11-02T00:00:00.000Z', 'last-delivery-status': 202 });
+  } finally {
+    await s.close();
+  }
+});
+
+test('A28: records made after that survive a restart', async () => {
+  const dir = mkdtempSync(join(dataDir, 'old-'));
+  oldDatabase(dir);
+  let s = await startOn(dir);
+  let token;
+  let id;
+  try {
+    assert.deepEqual(s.lines, [DROPPED]);
+    await listEmail(s.base, HOLDER);
+    token = (await tokenAt(s.base, HOLDER)).token;
+    const r = await request(s.base, 'POST', '/add', { headers: byToken(token, 'after', 'after-item'), body: BODY });
+    assert.equal(r.status, 201, r.json && r.json.error);
+    id = r.json.id;
+  } finally {
+    await s.close();
+  }
+  s = await startOn(dir);
+  try {
+    assert.deepEqual(s.lines, [], 'a later start drops nothing');
+    const inv = await request(s.base, 'GET', '/inventory', { headers: byToken(token) });
+    assert.equal(inv.status, 200, 'the token survives the restart');
+    assert.deepEqual(idsOf(inv.json.records), [id], 'the record survives the restart');
+    const st = await request(s.base, 'GET', '/status', { headers: byToken(token, 'after', 'after-item'), params: { id } });
+    assert.equal(st.json.record.what, BODY.what);
+  } finally {
+    await s.close();
+  }
 });

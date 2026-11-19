@@ -1,5 +1,5 @@
-// After an add has answered: the record POSTed once, as JSON, to the URL of every token whose scope covers
-// its atlas. No retry; each attempt under the timeout; the outcome written on the token, the latest only.
+// After an add has answered: the record POSTed once, as JSON, to the URL of the token that made it, and to no other.
+// No retry; the attempt under the timeout; the outcome written on that token's row, the latest only.
 
 const DEFAULT_TIMEOUT_MS = 10000;
 
@@ -8,10 +8,6 @@ export function timeoutMs(env) {
   const text = String(env?.DELIVERY_TIMEOUT_MS ?? '');
   const n = Number(text);
   return /^\d+$/.test(text) && Number.isSafeInteger(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
-}
-
-function covers(scope, atlas) {
-  return scope === 'all' || (typeof scope === 'string' && scope.split(',').includes(atlas));
 }
 
 // One attempt: the status of the response, 0 when none came (refused, unreachable, timed out); the date is the
@@ -32,19 +28,19 @@ async function attempt(db, row, record, env) {
     // no response: status stays 0
   }
   try {
-    db.prepare('UPDATE tokens SET last_delivery_date = ?, last_delivery_status = ? WHERE token = ?')
-      .run(date, status, row.token);
+    db.prepare('UPDATE tokens SET last_delivery_date = ?, last_delivery_status = ? WHERE id = ?')
+      .run(date, status, row.id);
   } catch {
     // the outcome is lost; the add is unaffected
   }
 }
 
-// Every in-scope token with a URL, in parallel; the promise never rejects and the server never awaits it.
-export function deliver(db, record, env) {
+// The making token's row, when it has a URL; the promise never rejects and the server never awaits it.
+export function deliver(db, record, tokenId, env) {
   try {
-    const rows = db.prepare('SELECT token, scope, url FROM tokens WHERE url IS NOT NULL').all()
-      .filter((row) => covers(row.scope, record['atlas-slug']));
-    return Promise.allSettled(rows.map((row) => attempt(db, row, record, env))).then(() => undefined);
+    const row = db.prepare('SELECT id, url FROM tokens WHERE id = ? AND url IS NOT NULL').get(tokenId);
+    if (!row) return Promise.resolve();
+    return attempt(db, row, record, env).catch(() => undefined);
   } catch {
     return Promise.resolve();
   }
