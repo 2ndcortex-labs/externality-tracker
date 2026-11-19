@@ -15,9 +15,10 @@ const MAX_BODY = 1024 * 1024;
 // The two open addresses, `/<part>/notify` and `/<part>/status`; anything else falls through to the route table.
 const ADDRESS = /^\/([^/]+)\/(notify|status)$/;
 
-// Each route reads one credential: none (the ask, under the limit), the admin token ('admin') or a holder's token ('token').
+// Each route reads one credential: none (the ask, under the limit; a later ask's own token is checked by `ask`), the
+// admin token ('admin') or a holder's token ('token').
 const ROUTES = {
-  'POST /tokens': { credential: 'none', handler: (db, call, url, body) => ask(db, body) },
+  'POST /tokens': { credential: 'none', handler: (db, call, url, body) => ask(db, body, call.bearer) },
   'POST /emails': { credential: 'admin', handler: (db, call, url, body) => addEmail(db, body) },
   'POST /emails/active': { credential: 'admin', handler: (db, call, url, body) => setActive(db, body) },
   'POST /add': { credential: 'token', handler: (db, call, url, body) => add(db, call, body) },
