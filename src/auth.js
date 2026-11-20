@@ -7,10 +7,9 @@ export class HttpError extends Error {
   }
 }
 
+// The org slug is the one call value besides the credential; no other slug is read.
 const VALUES = [
   ['org', 'x-org-slug', 'org-slug'],
-  ['atlas', 'x-atlas-slug', 'atlas-slug'],
-  ['item', 'x-item-slug', 'item-slug'],
 ];
 
 // The rule of ADDRESS_KEY and ADMIN_TOKEN: letters, digits, - and _ only, 32 characters or more.
@@ -53,7 +52,7 @@ function bearer(req) {
   return m ? m[1].trim() : null;
 }
 
-// The bearer credential from its header only; the slugs header first, then URL parameter.
+// The bearer credential from its header only; the org slug header first, then URL parameter.
 export function resolveCall(req, url) {
   const call = {};
   call.bearer = bearer(req);

@@ -1,30 +1,14 @@
-import { randomBytes, randomUUID } from 'node:crypto';
-import { toWire, toTokenWire, toThirdpartyWire } from './db.js';
+import { randomBytes } from 'node:crypto';
+import { toTokenWire, toThirdpartyWire } from './db.js';
 import { HttpError, safeEqual } from './auth.js';
 
 export { HttpError };
 
-const TEXT = { 'what': 'what', 'who-acts': 'who_acts', 'how-observed': 'how_observed' };
-const STATES = ['open', 'cleared'];
 const URL_REASON = 'url must be an absolute http or https URL';
 const ADDRESS_REASON = 'email must be one address: one @, text on both sides, no space and no +';
 
 function isText(v) {
   return typeof v === 'string' && v.trim() !== '';
-}
-
-function needSlugs(call) {
-  if (!call.atlas) throw new HttpError(400, 'atlas-slug is required');
-  if (!call.item) throw new HttpError(400, 'item-slug is required');
-}
-
-// A record of the calling token's own, matching the call's atlas and item; any other answers as absent.
-function findOwn(db, id, call) {
-  const row = db.prepare('SELECT * FROM externalities WHERE id = ? AND org = ? AND token_id = ?').get(id, call.org, call.tokenRow.id);
-  if (!row || row.atlas !== call.atlas || row.item !== call.item) {
-    throw new HttpError(404, 'unknown id');
-  }
-  return row;
 }
 
 function isObject(body) {
@@ -141,93 +125,6 @@ export function ask(db, body, bearer = null) {
   // Another ask renewed the row first: the matched token is no longer current.
   if (r.changes !== 1) throw new HttpError(401, 'refused');
   return [200, row];
-}
-
-export function add(db, call, body) {
-  needSlugs(call);
-  if (!isObject(body)) throw new HttpError(400, 'body must be a JSON object');
-  for (const field of Object.keys(TEXT)) {
-    if (!isText(body[field])) throw new HttpError(400, `${field} must be a non-empty string`);
-  }
-  const row = {
-    id: randomUUID(), org: call.org, atlas: call.atlas, item: call.item,
-    what: body['what'], who_acts: body['who-acts'], how_observed: body['how-observed'],
-    state: 'open', set_date: new Date().toISOString(), cleared_date: null, cleared_words: null,
-  };
-  db.prepare(`INSERT INTO externalities
-    (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words, token_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    row.id, row.org, row.atlas, row.item, row.what, row.who_acts, row.how_observed,
-    row.state, row.set_date, row.cleared_date, row.cleared_words, call.tokenRow.id);
-  return [201, { id: row.id, record: toWire(row) }];
-}
-
-export function update(db, call, body) {
-  needSlugs(call);
-  if (!isObject(body)) throw new HttpError(400, 'body must be a JSON object');
-  if (!isText(body.id)) throw new HttpError(400, 'id must be a non-empty string');
-  const fields = [...Object.keys(TEXT), 'state', 'cleared-words'].filter((f) => f in body);
-  if (fields.length === 0) throw new HttpError(400, 'nothing to update besides id');
-  for (const field of [...Object.keys(TEXT), 'cleared-words']) {
-    if (field in body && !isText(body[field])) {
-      throw new HttpError(400, `${field} must be a non-empty string`);
-    }
-  }
-  if ('state' in body && !STATES.includes(body.state)) {
-    throw new HttpError(400, 'state must be open or cleared');
-  }
-  const row = { ...findOwn(db, body.id, call) };
-  for (const [field, column] of Object.entries(TEXT)) {
-    if (field in body) row[column] = body[field];
-  }
-  if (body.state === 'cleared') {
-    if (!('cleared-words' in body)) throw new HttpError(400, 'cleared-words is required to clear');
-    row.state = 'cleared';
-    row.cleared_date = new Date().toISOString();
-    row.cleared_words = body['cleared-words'];
-  } else if (body.state === 'open') {
-    if ('cleared-words' in body) throw new HttpError(400, 'cleared-words cannot be set on a reopening');
-    row.state = 'open';
-    row.cleared_date = null;
-    row.cleared_words = null;
-  } else if ('cleared-words' in body) {
-    if (row.state !== 'cleared') throw new HttpError(400, 'cleared-words needs a cleared record');
-    row.cleared_words = body['cleared-words'];
-  }
-  db.prepare(`UPDATE externalities SET what = ?, who_acts = ?, how_observed = ?, state = ?,
-    cleared_date = ?, cleared_words = ? WHERE id = ?`).run(
-    row.what, row.who_acts, row.how_observed, row.state, row.cleared_date, row.cleared_words, row.id);
-  return [200, { record: toWire(row) }];
-}
-
-export function status(db, call, url) {
-  const id = url.searchParams.get('id');
-  if (!id) throw new HttpError(400, 'id is required');
-  needSlugs(call);
-  return [200, { record: toWire(findOwn(db, id, call)) }];
-}
-
-export function inventory(db, call, url) {
-  const where = ['org = ?', 'token_id = ?'];
-  const args = [call.org, call.tokenRow.id];
-  if (call.atlas) { where.push('atlas = ?'); args.push(call.atlas); }
-  if (call.item) { where.push('item = ?'); args.push(call.item); }
-  const state = url.searchParams.get('state');
-  if (state !== null) {
-    if (!STATES.includes(state)) throw new HttpError(400, 'state must be open or cleared');
-    where.push('state = ?');
-    args.push(state);
-  }
-  const q = url.searchParams.get('q');
-  if (q !== null) {
-    if (q === '') throw new HttpError(400, 'q must be a non-empty string');
-    const pattern = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
-    where.push(`(what LIKE ? ESCAPE '\\' OR who_acts LIKE ? ESCAPE '\\' OR how_observed LIKE ? ESCAPE '\\')`);
-    args.push(pattern, pattern, pattern);
-  }
-  const rows = db.prepare(`SELECT * FROM externalities WHERE ${where.join(' AND ')}
-    ORDER BY set_date DESC, id ASC`).all(...args);
-  return [200, { records: rows.map(toWire) }];
 }
 
 // The calling token's own record, read by its own credential.

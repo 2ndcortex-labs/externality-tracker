@@ -6,6 +6,8 @@ import { HttpError } from './auth.js';
 
 const RECORD = 'the body must be a JSON record of named fields';
 const STATES = ['open', 'cleared'];
+// How long a notice lasts from its receipt: 90 times 24 hours, fixed; no setting changes it.
+const LASTS_MS = 90 * 24 * 60 * 60 * 1000;
 
 function isText(v) {
   return typeof v === 'string' && v.trim() !== '';
@@ -45,14 +47,21 @@ export function test(text) {
   return body;
 }
 
-// Keeps the notice as its own row under the sending token's row, the body's text as received; answers its id and
-// nothing else. The parsed record follows the answer, for the caller's passing-on; it is never sent back.
+// Keeps the notice as its own row under the sending token's row, the body's text as received; answers that it was kept
+// and nothing else (the row's id is given out nowhere). Then the clean-up: every notice of any token received more than
+// 90 days before this one is deleted; a failed delete costs the notice nothing. The parsed record follows the answer,
+// for the caller's passing-on; it is never sent back.
 export function keep(db, text, tokenId) {
   const body = test(text);
-  const id = randomUUID();
+  const now = Date.now();
   db.prepare('INSERT INTO notices (id, item, state, what, body, received, token_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(id, body.item, body.state, body.what, text, new Date().toISOString(), tokenId);
-  return [201, { id }, body];
+    .run(randomUUID(), body.item, body.state, body.what, text, new Date(now).toISOString(), tokenId);
+  try {
+    db.prepare('DELETE FROM notices WHERE received < ?').run(new Date(now - LASTS_MS).toISOString());
+  } catch {
+    // the old notices stay until the next notice is kept; this one is kept and answered
+  }
+  return [201, { kept: true }, body];
 }
 
 // The calling token's notices for the reference, matched exactly, newest received first, the later-inserted first in
