@@ -759,77 +759,68 @@ async function closedPortUrl() {
   return `http://127.0.0.1:${port}/hook`;
 }
 
-async function tokenRecord(token) {
-  const r = await call('GET', '/token', { headers: byToken(token) });
-  assert.equal(r.status, 200, r.json && r.json.error);
-  return r.json;
-}
-
-// Polls GET /token every 50 ms, up to 3 s, until `done` holds: by default, until a delivery has settled.
-async function settled(token, done = (t) => t['last-delivery-date'] !== null) {
-  for (let i = 0; i < 60; i++) {
-    const t = await tokenRecord(token);
-    if (done(t)) return t;
-    await sleep(50);
-  }
-  return assert.fail('no delivery settled within 3 s');
-}
-
-async function addFull(atlas, item, token) {
-  const r = await call('POST', '/add', { headers: byToken(token, atlas, item), body: BODY });
-  assert.equal(r.status, 201, JSON.stringify(r.json));
-  return r.json;
-}
-
 const TOKEN_FIELDS = ['date', 'last-delivery-date', 'last-delivery-status', 'url'];
 
 test("A23: a new record reaches its own token's URL once and no other token's; a token without a URL receives nothing", async () => {
+  // The record is a notice, forwarded on a server with the notice address on and loopback exempt.
   const rxA = await receiver();
   const rxB = await receiver();
-  const a = await newToken(rxA.url);
-  const b = await newToken(rxB.url);
-  const none = await newToken();
-  const added = await addFull('a23', 'a23-item', a.token);
-  const outcome = await settled(a.token);
-  assert.equal(outcome['last-delivery-status'], 200);
-  assert.match(outcome['last-delivery-date'], ISO);
-  await sleep(NEGATIVE_WAIT);
-  assert.equal(rxA.withId(added.id).length, 1, 'once, to its own token');
-  assert.equal(rxA.requests.length, 1);
-  assert.equal(rxB.requests.length, 0, "no other token's URL");
-  const quiet = await addFull('a23', 'a23-item', none.token);
-  await sleep(NEGATIVE_WAIT);
-  assert.equal(rxA.withId(quiet.id).length + rxB.withId(quiet.id).length, 0, 'a token without a URL sends nowhere');
-  assert.equal(rxA.requests.length + rxB.requests.length, 1);
-  for (const t of [b, none]) {
-    const rec = await tokenRecord(t.token);
-    assert.equal(rec['last-delivery-date'], null);
-    assert.equal(rec['last-delivery-status'], null);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const a = await s.token(rxA.url);
+    const b = await s.token(rxB.url);
+    const none = await s.token();
+    const sent = JSON.stringify(notice('feature/a23', 'open'));
+    assert.deepEqual(await s.notify(a, sent), KEPT);
+    const outcome = await forwarded(s, a);
+    assert.equal(outcome['last-delivery-status'], 200);
+    assert.match(outcome['last-delivery-date'], ISO);
+    await sleep(NEGATIVE_WAIT);
+    assert.deepEqual(rxA.requests.map((q) => q.body), [sent], 'once, to its own token');
+    assert.equal(rxB.requests.length, 0, "no other token's URL");
+    assert.deepEqual(await s.notify(none, notice('feature/a23', 'cleared')), KEPT);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rxA.requests.length + rxB.requests.length, 1, 'a token without a URL sends nowhere');
+    for (const t of [b, none]) {
+      const rec = (await s.tokenInfo(t)).json;
+      assert.equal(rec['last-delivery-date'], null);
+      assert.equal(rec['last-delivery-status'], null);
+    }
+  } finally {
+    await s.close();
   }
 });
 
 test('delivery: a token without a URL stays at nulls', async () => {
-  const t = await newToken();
-  assert.equal(t.url, null);
-  await addFull('dlv-no-url', 'dlv-no-url-item', t.token);
-  await sleep(NEGATIVE_WAIT);
-  const rec = await tokenRecord(t.token);
-  assert.equal(rec.url, null);
-  assert.equal(rec['last-delivery-date'], null);
-  assert.equal(rec['last-delivery-status'], null);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token();
+    assert.deepEqual(await s.notify(t, notice('feature/dlv-no-url', 'open')), KEPT);
+    await sleep(NEGATIVE_WAIT);
+    const rec = (await s.tokenInfo(t)).json;
+    assert.equal(rec.url, null);
+    assert.equal(rec['last-delivery-date'], null);
+    assert.equal(rec['last-delivery-status'], null);
+  } finally {
+    await s.close();
+  }
 });
 
 test('delivery: a receiver answering 500 stores 500 and is called once', async () => {
   const rx = await receiver(500);
-  const t = await newToken(rx.url);
-  const added = await addFull('dlv-500', 'dlv-500-item', t.token);
-  const outcome = await settled(t.token);
-  assert.equal(outcome['last-delivery-status'], 500);
-  assert.match(outcome['last-delivery-date'], ISO);
-  assert.equal(rx.withId(added.id).length, 1);
-  await sleep(NEGATIVE_WAIT);
-  assert.equal(rx.withId(added.id).length, 1, 'no retry');
-  assert.equal(rx.requests.length, 1);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    assert.deepEqual(await s.notify(t, notice('feature/dlv-500', 'open')), KEPT);
+    const outcome = await forwarded(s, t);
+    assert.equal(outcome['last-delivery-status'], 500);
+    assert.match(outcome['last-delivery-date'], ISO);
+    assert.equal(rx.requests.length, 1);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rx.requests.length, 1, 'no retry');
+  } finally {
+    await s.close();
+  }
 });
 
 test('delivery: a never-answering receiver stores 0, connected once, the add answering 201 first', async () => {
@@ -867,19 +858,26 @@ test('delivery: a closed port stores 0 and the add answers 201 in shape', async 
 });
 
 test('delivery: a second add overwrites the outcome', async () => {
+  // A second notice's forwarding overwrites the first's outcome.
   const rx = await receiver(200);
-  const t = await newToken(rx.url);
-  const first = await addFull('dlv-overwrite', 'dlv-overwrite-item', t.token);
-  const one = await settled(t.token);
-  assert.equal(one['last-delivery-status'], 200);
-  rx.status = 500;
-  const second = await addFull('dlv-overwrite', 'dlv-overwrite-item', t.token);
-  const two = await settled(t.token, (x) => x['last-delivery-status'] === 500);
-  assert.equal(two['last-delivery-status'], 500);
-  assert.match(two['last-delivery-date'], ISO);
-  assert.ok(two['last-delivery-date'] >= one['last-delivery-date'], 'the later attempt dated no earlier');
-  assert.equal(rx.withId(first.id).length, 1);
-  assert.equal(rx.withId(second.id).length, 1);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    const first = JSON.stringify(notice('feature/dlv-overwrite', 'open'));
+    assert.deepEqual(await s.notify(t, first), KEPT);
+    const one = await forwarded(s, t);
+    assert.equal(one['last-delivery-status'], 200);
+    rx.status = 500;
+    const second = JSON.stringify(notice('feature/dlv-overwrite', 'cleared'));
+    assert.deepEqual(await s.notify(t, second), KEPT);
+    const two = await forwarded(s, t, (x) => x['last-delivery-status'] === 500);
+    assert.equal(two['last-delivery-status'], 500);
+    assert.match(two['last-delivery-date'], ISO);
+    assert.ok(two['last-delivery-date'] >= one['last-delivery-date'], 'the later attempt dated no earlier');
+    assert.deepEqual(rx.requests.map((q) => q.body), [first, second], 'each notice once');
+  } finally {
+    await s.close();
+  }
 });
 
 test('GET /token: the token record without the token value, nulls before any delivery', async () => {
@@ -1033,18 +1031,18 @@ test('notify: a kept notice answers 201 with its id alone; two notices, two ids;
   const one = await post(notice(item, 'open'));
   const two = await post(notice(item, 'open'));
   for (const r of [one, two]) {
-    assert.deepEqual(Object.keys(r), ['id']);
-    assert.match(r.id, UUID);
+    assert.deepEqual(r, { kept: true }, 'the R9 answer: kept, no id');
   }
-  assert.notEqual(one.id, two.id);
   const own = partTokenId();
   const db = new DatabaseSync(join(partDir, 'externalities.sqlite'));
   try {
     const columns = db.prepare('PRAGMA table_info(notices)').all().map((c) => c.name);
     assert.deepEqual(columns, ['id', 'item', 'state', 'what', 'body', 'received', 'token_id']);
     const rows = db.prepare('SELECT * FROM notices WHERE item = ?').all(item);
-    assert.deepEqual(rows.map((r) => r.id).sort(), [one.id, two.id].sort());
+    assert.equal(rows.length, 2, 'one row each');
+    assert.notEqual(rows[0].id, rows[1].id);
     for (const row of rows) {
+      assert.match(row.id, UUID, 'the row is given an id, which no call returns');
       assert.equal(row.state, 'open');
       assert.equal(row.what, 'a vendor key is issued');
       assert.deepEqual(JSON.parse(row.body), notice(item, 'open'));
@@ -1623,7 +1621,8 @@ test('A25: the schema names token_id on both tables as a foreign key to tokens, 
   const db = openMain();
   try {
     const fks = (table) => db.prepare(`PRAGMA foreign_key_list(${table})`).all().map((f) => [f.from, f.table, f.to]);
-    assert.deepEqual(fks('externalities'), [['token_id', 'tokens', 'id']]);
+    // The add store `externalities` is gone; `notices` is the one table of token_id.
+    assert.equal(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'externalities'").get().n, 0);
     assert.deepEqual(fks('notices'), [['token_id', 'tokens', 'id']]);
     assert.deepEqual(fks('tokens'), [['authorized_email', 'authorized_emails', 'id']]);
     assert.deepEqual(fks('authorized_emails'), []);
@@ -1634,7 +1633,7 @@ test('A25: the schema names token_id on both tables as a foreign key to tokens, 
     for (const table of ['authorized_emails', 'tokens']) {
       assert.deepEqual(cols(table).filter((c) => c.pk).map((c) => c.name), ['id'], `${table} is keyed by id`);
     }
-    for (const table of ['externalities', 'notices']) {
+    for (const table of ['notices']) {
       const tokenId = cols(table).find((c) => c.name === 'token_id');
       assert.ok(tokenId, `${table} holds token_id`);
       assert.equal(tokenId.notnull, 1, `${table}.token_id is required`);
@@ -2861,20 +2860,23 @@ test('one-way A28: each remaining route, called with an old notice in place, del
 });
 
 // The shipped cases that use no retired call, each as the SHA-256 (first 16 hex digits) of its text at 792a883: a case
-// is each `test(` with a literal name, to the first `})` line at its own indent.
+// is each `test(` with a literal name, to the first `})` line at its own indent. Six cases the class rule first counted
+// here are left out by the lead's ruling, as they used the add call through a helper or asserted what the spec changes:
+// A23, "delivery: a token without a URL…", "delivery: a receiver answering 500…", "delivery: a second add…",
+// "notify: a kept notice answers 201…" and A25.
 const UNCHANGED_AT_792A883 = [
   'b300989daba04199', 'b5738f205d9ab3a1', '0f43b4135eff94de', '78cf598e9eecfac5', 'abb29dbd7643aff8',
   'e9a7b46a11023201', '8bbd9a123d15403a', '35c367723c01ce8f', 'f7e304fdfa08bb39', '39207af54b4b9500',
   'a16bc8033f2e5b00', '41213260e2271665', '94dc63dde49b0d9c', '9785a2f3f7a55c33', '11bc171138af2ff3',
   '5629cf2a91fd4dde', '45136a18b1383f17', '77b56bf87d44e011', 'f937cc2aa8caeeeb', '8037cbc973aa5191',
-  '908e6d2f7db75a30', 'c1eae32386140274', '672fbde65a117b27', '279e985b06371f46', 'ed7d3342bef027d8',
+  '908e6d2f7db75a30',
   '4909c9edca4cbb28', '97a8602bddddb85c', 'd5114455731ab0ca', '3e57e0258d2ea3f8', '2055188dc2962ea6',
-  'f89c996dbc1dbd58', '21302f13ac94df60', '408cb0096781d4f9', '301e5bab9a5d5396', 'fb9121eadcb8d2d2',
+  'f89c996dbc1dbd58', '408cb0096781d4f9', '301e5bab9a5d5396', 'fb9121eadcb8d2d2',
   'ca0e73b0a8aa88e7', 'af435540528016a2', '55b94268cf626aff', 'a86fb28d702233f4', 'b10ce2d67d364dda',
   '790d8776bb1f6c0e', 'd7fe457063d1fa86', '448f008452df69a2', 'd478c38909e72a31', '0c3ab4666e7da24f',
   'cf7f7a92b2a4930c', 'e7fd0a0323bb1868', '73b33929ae8a1dc4', '9e7d1a38f2c7d05f', '29a43beaeca66668',
   'c9a0f8e5e9ce8803', '942be3bbee2e7b3a', '205a852360edded1', '8867d343bd501c63', '48a7fce6e958b5d8',
-  'e3402deeb45593ef', '410726760abb39c4', '14874e6f76349bf6', '0fc7ee730be156f5', 'c966ecfa79441c95',
+  'e3402deeb45593ef', '410726760abb39c4', '0fc7ee730be156f5', 'c966ecfa79441c95',
   'cb53b3de5d37e76f', 'f175901036f94a3d', '0cfff9542bd0dfa3', '9796fd99898a589a', '506368273ad05ccd',
   'ee021bc47293093f', '218f9a7d5c990df5', 'ebe27ccc732ef6b6',
 ];
@@ -2890,7 +2892,7 @@ test('one-way A29: every shipped case that uses no retired call is byte-equal to
     while (j < lines.length && !end.test(lines[j])) j++;
     have.add(createHash('sha256').update(lines.slice(i, j + 1).join('\n')).digest('hex').slice(0, 16));
   }
-  assert.equal(UNCHANGED_AT_792A883.length, 68);
+  assert.equal(UNCHANGED_AT_792A883.length, 62);
   assert.deepEqual(UNCHANGED_AT_792A883.filter((h) => !have.has(h)), [], 'each such case is present, byte for byte');
 });
 
