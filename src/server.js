@@ -3,11 +3,9 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { loadAuthConfig, loadAddressKey, matchesPart, resolveCall, authenticateAdmin, authenticateToken } from './auth.js';
 import { openDb } from './db.js';
-import {
-  HttpError, LIMITS, makeLimiter, ask, addEmail, setActive, add, update, status, inventory, tokenInfo, thirdpartyInfo,
-} from './routes.js';
+import { HttpError, LIMITS, makeLimiter, ask, addEmail, setActive, tokenInfo, thirdpartyInfo } from './routes.js';
 import { keep, readStatus } from './notices.js';
-import { deliver, timeoutMs } from './deliver.js';
+import { forward, timeoutMs } from './deliver.js';
 import { PASSED_ON, parseAllow, passOn } from './thirdparty.js';
 
 const STARTED = new Date(performance.timeOrigin).toISOString();
@@ -21,10 +19,6 @@ const ROUTES = {
   'POST /tokens': { credential: 'none', handler: (db, call, url, body) => ask(db, body, call.bearer) },
   'POST /emails': { credential: 'admin', handler: (db, call, url, body) => addEmail(db, body) },
   'POST /emails/active': { credential: 'admin', handler: (db, call, url, body) => setActive(db, body) },
-  'POST /add': { credential: 'token', handler: (db, call, url, body) => add(db, call, body) },
-  'POST /update': { credential: 'token', handler: (db, call, url, body) => update(db, call, body) },
-  'GET /status': { credential: 'token', handler: (db, call, url) => status(db, call, url) },
-  'GET /inventory': { credential: 'token', handler: (db, call, url) => inventory(db, call, url) },
   'GET /token': { credential: 'token', handler: (db, call) => tokenInfo(call) },
   'GET /thirdparty': { credential: 'token', handler: (db) => thirdpartyInfo(db) },
 };
@@ -90,9 +84,12 @@ export function createServer(env = process.env, { limits = LIMITS } = {}) {
           const text = await readText(req);
           const [code, payload, record] = keep(db, text, tokenRow.id);
           send(res, code, payload);
-          // A notice that is itself a passing-on (it carries PASSED_ON, any value) is kept but never passed on again.
+          // A notice that is itself a passing-on (it carries PASSED_ON, any value) is kept but neither forwarded nor
+          // passed on again.
           if (Object.hasOwn(req.headers, PASSED_ON)) return;
-          // The notice is kept and answered; its passing-on to a third party starts now and is never awaited.
+          // The notice is kept and answered; its forwarding to the sending token's address and its passing-on to a
+          // third party start now, side by side, and neither is awaited.
+          void forward(db, tokenRow, text, { allow, timeout: timeoutMs(env) });
           void passOn(db, record, text, { allow, timeout: timeoutMs(env) });
           return;
         }
@@ -106,17 +103,13 @@ export function createServer(env = process.env, { limits = LIMITS } = {}) {
         authenticateAdmin(call, config);
       } else if (route.credential === 'token') {
         call.tokenRow = authenticateToken(call, db, config);
-        call.org = config.org;
       } else if (!mayAsk(callerAddress(req))) {
         // The limit comes before the body and the address; every post counts, whatever its answer.
         return send(res, 429, { error: 'too many asks' });
       }
       const body = req.method === 'POST' ? await readJson(req) : undefined;
       const [code, payload] = route.handler(db, call, url, body);
-      send(res, code, payload);
-      // The add has answered; its delivery to its own token's URL starts now and is never awaited.
-      if (name === 'POST /add' && code === 201) void deliver(db, payload.record, call.tokenRow.id, env);
-      return;
+      return send(res, code, payload);
     } catch (err) {
       if (err instanceof HttpError) return send(res, err.status, { error: err.message });
       console.error(err);
