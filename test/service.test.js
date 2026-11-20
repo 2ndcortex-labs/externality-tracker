@@ -20,8 +20,6 @@ const ORG = 'test-org';
 const OLD_KEY = 'test-key-0123456789'; // a value of the old org key's kind: it opens nothing now
 const ADMIN = randomBytes(32).toString('base64url'); // the test servers' ADMIN_TOKEN, never printed
 const HOLDER = 'holder@example.org'; // every address here is a made-up one at example.org
-const FIELDS = ['id', 'org-slug', 'atlas-slug', 'item-slug', 'what', 'who-acts', 'how-observed',
-  'state', 'set-date', 'cleared-date', 'cleared-words'];
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DELIVERY_TIMEOUT = 400; // the test server's DELIVERY_TIMEOUT_MS
@@ -83,7 +81,6 @@ const byToken = (token, atlas, item, extra = {}) => ({
   ...bearer(token),
   ...(atlas ? { 'X-Atlas-Slug': atlas } : {}), ...(item ? { 'X-Item-Slug': item } : {}), ...extra,
 });
-const auth = (atlas, item, extra = {}) => byToken(TOKEN, atlas, item, { 'X-Org-Slug': ORG, ...extra });
 const read = (atlas, item, extra) => byToken(TOKEN, atlas, item, extra);
 
 // The admin endpoints and the ask, against any server. No failure message carries a token.
@@ -116,153 +113,12 @@ const openMain = () => new DatabaseSync(join(dataDir, 'externalities.sqlite'));
 
 const BODY = { 'what': 'a thing is true', 'who-acts': 'the operator', 'how-observed': 'by a check' };
 
-async function addOne(atlas, item, body = BODY) {
-  const r = await call('POST', '/add', { headers: auth(atlas, item), body });
-  assert.equal(r.status, 201, JSON.stringify(r.json));
-  return r.json.id;
-}
-
-const idsOf = (recs) => recs.map((r) => r.id).sort();
-
-test('add returns 201 with an id and the record', async () => {
-  const r = await call('POST', '/add', { headers: auth('atlas-a', 'item-a'), body: BODY });
-  assert.equal(r.status, 201);
-  assert.equal(typeof r.json.id, 'string');
-  assert.ok(r.json.id.length > 0);
-  assert.equal(r.json.record.id, r.json.id);
-  assert.equal(r.json.record.state, 'open');
-  // `none` is the documented atlas slug of an item under no atlas: free text, accepted like any other.
-  const none = await call('POST', '/add', { headers: auth('none', 'item-none'), body: BODY });
-  assert.equal(none.status, 201, JSON.stringify(none.json));
-  assert.equal(none.json.record['atlas-slug'], 'none');
-});
-
-test('add refuses missing slugs and missing fields with 400', async () => {
-  assert.equal((await call('POST', '/add', { headers: auth(null, 'i'), body: BODY })).status, 400);
-  assert.equal((await call('POST', '/add', { headers: auth('n', null), body: BODY })).status, 400);
-  const r = await call('POST', '/add', { headers: auth('n', 'i'), body: { what: 'x', 'who-acts': 'y' } });
-  assert.equal(r.status, 400);
-  assert.equal(typeof r.json.error, 'string');
-  assert.equal((await call('POST', '/add', { headers: auth('n', 'i'), body: { ...BODY, what: '' } })).status, 400);
-});
-
-test('status returns the eleven fields exactly with ISO timestamps', async () => {
-  const id = await addOne('atlas-s', 'item-s');
-  const r = await call('GET', '/status', { headers: read('atlas-s', 'item-s'), params: { id } });
-  assert.equal(r.status, 200);
-  assert.deepEqual(Object.keys(r.json.record).sort(), [...FIELDS].sort());
-  const rec = r.json.record;
-  assert.equal(rec.id, id);
-  assert.equal(rec['org-slug'], ORG);
-  assert.equal(rec['atlas-slug'], 'atlas-s');
-  assert.equal(rec['item-slug'], 'item-s');
-  assert.equal(rec.what, BODY.what);
-  assert.equal(rec['who-acts'], BODY['who-acts']);
-  assert.equal(rec['how-observed'], BODY['how-observed']);
-  assert.equal(rec.state, 'open');
-  assert.match(rec['set-date'], ISO);
-  assert.equal(rec['cleared-date'], null);
-  assert.equal(rec['cleared-words'], null);
-});
-
-test('status: missing id 400, unknown id 404, wrong atlas or item 404', async () => {
-  const id = await addOne('atlas-t', 'item-t');
-  assert.equal((await call('GET', '/status', { headers: read('atlas-t', 'item-t') })).status, 400);
-  assert.equal((await call('GET', '/status', { headers: read('atlas-t', 'item-t'), params: { id: 'nope' } })).status, 404);
-  assert.equal((await call('GET', '/status', { headers: read('other', 'item-t'), params: { id } })).status, 404);
-  assert.equal((await call('GET', '/status', { headers: read('atlas-t', 'other'), params: { id } })).status, 404);
-});
-
-test('update changes text, clears with words and a date, reopens', async () => {
-  const h = read('atlas-u', 'item-u');
-  const id = await addOne('atlas-u', 'item-u');
-
-  let r = await call('POST', '/update', { headers: h, body: { id, what: 'new what', 'who-acts': 'new who' } });
-  assert.equal(r.status, 200);
-  assert.equal(r.json.record.what, 'new what');
-  assert.equal(r.json.record['who-acts'], 'new who');
-  assert.equal(r.json.record['how-observed'], BODY['how-observed']);
-
-  r = await call('POST', '/update', { headers: h, body: { id, state: 'cleared' } });
-  assert.equal(r.status, 400, 'clearing needs words');
-
-  r = await call('POST', '/update', { headers: h, body: { id, state: 'cleared', 'cleared-words': 'done, by the operator' } });
-  assert.equal(r.status, 200);
-  assert.equal(r.json.record.state, 'cleared');
-  assert.equal(r.json.record['cleared-words'], 'done, by the operator');
-  assert.match(r.json.record['cleared-date'], ISO);
-
-  r = await call('GET', '/status', { headers: h, params: { id } });
-  assert.equal(r.json.record.state, 'cleared');
-
-  r = await call('POST', '/update', { headers: h, body: { id, state: 'open' } });
-  assert.equal(r.status, 200);
-  assert.equal(r.json.record.state, 'open');
-  assert.equal(r.json.record['cleared-date'], null);
-  assert.equal(r.json.record['cleared-words'], null);
-});
-
-test('update: 404 on wrong atlas, wrong item, unknown id; 400 on bad input', async () => {
-  const id = await addOne('atlas-v', 'item-v');
-  assert.equal((await call('POST', '/update', { headers: read('other', 'item-v'), body: { id, what: 'x' } })).status, 404);
-  assert.equal((await call('POST', '/update', { headers: read('atlas-v', 'other'), body: { id, what: 'x' } })).status, 404);
-  assert.equal((await call('POST', '/update', { headers: read('atlas-v', 'item-v'), body: { id: 'nope', what: 'x' } })).status, 404);
-  assert.equal((await call('POST', '/update', { headers: read('atlas-v', 'item-v'), body: { id } })).status, 400);
-  assert.equal((await call('POST', '/update', { headers: read('atlas-v', 'item-v'), body: { id, state: 'gone' } })).status, 400);
-  assert.equal((await call('POST', '/update', { headers: read('atlas-v', 'item-v'), body: { what: 'x' } })).status, 400);
-});
-
-test('inventory by none, atlas, item, both and state, newest first', async () => {
-  const ids = {};
-  for (const [atlas, item] of [['inv-n1', 'inv-i1'], ['inv-n1', 'inv-i2'], ['inv-n2', 'inv-i1'], ['inv-n2', 'inv-i2']]) {
-    ids[`${atlas}/${item}`] = await addOne(atlas, item);
-    await sleep(5);
-  }
-  const ids4 = Object.values(ids);
-  const list = async (atlas, item, params = {}) => {
-    const r = await call('GET', '/inventory', { headers: read(atlas, item), params });
-    assert.equal(r.status, 200);
-    return r.json.records;
-  };
-  const sortedDesc = (recs) => {
-    for (let i = 1; i < recs.length; i++) {
-      assert.ok(recs[i - 1]['set-date'] >= recs[i]['set-date'], 'newest first');
-    }
-  };
-
-  const all = await list(null, null);
-  sortedDesc(all);
-  const allIds = all.map((r) => r.id);
-  for (const id of ids4) assert.ok(allIds.includes(id));
-  assert.deepEqual(all.filter((r) => ids4.includes(r.id)).map((r) => r.id), [...ids4].reverse());
-
-  const byAtlas = await list('inv-n1', null);
-  assert.deepEqual(byAtlas.map((r) => r.id), [ids['inv-n1/inv-i2'], ids['inv-n1/inv-i1']]);
-
-  const byItem = await list(null, 'inv-i1');
-  assert.deepEqual(byItem.map((r) => r.id), [ids['inv-n2/inv-i1'], ids['inv-n1/inv-i1']]);
-
-  const both = await list('inv-n2', 'inv-i2');
-  assert.deepEqual(both.map((r) => r.id), [ids['inv-n2/inv-i2']]);
-
-  const h = read('inv-n2', 'inv-i2');
-  await call('POST', '/update', { headers: h, body: { id: ids['inv-n2/inv-i2'], state: 'cleared', 'cleared-words': 'ok' } });
-  const cleared = await list('inv-n2', null, { state: 'cleared' });
-  assert.deepEqual(cleared.map((r) => r.id), [ids['inv-n2/inv-i2']]);
-  const open = await list('inv-n2', null, { state: 'open' });
-  assert.deepEqual(open.map((r) => r.id), [ids['inv-n2/inv-i1']]);
-  for (const r of await list(null, null, { state: 'open' })) assert.equal(r.state, 'open');
-
-  assert.equal((await call('GET', '/inventory', { headers: read(), params: { state: 'other' } })).status, 400);
-  assert.equal((await list('inv-n1', null, { page: '2' })).length, 2, 'page is ignored');
-});
-
 test('precedence: org-slug from header, param, header wins', async () => {
   const h = read();
-  assert.equal((await call('GET', '/inventory', { headers: { ...h, 'X-Org-Slug': ORG } })).status, 200);
-  assert.equal((await call('GET', '/inventory', { headers: h, params: { 'org-slug': ORG } })).status, 200);
-  assert.equal((await call('GET', '/inventory', { headers: { ...h, 'X-Org-Slug': ORG }, params: { 'org-slug': 'wrong' } })).status, 200);
-  assert.equal((await call('GET', '/inventory', { headers: { ...h, 'X-Org-Slug': 'wrong' }, params: { 'org-slug': ORG } })).status, 401);
+  assert.equal((await call('GET', '/token', { headers: { ...h, 'X-Org-Slug': ORG } })).status, 200);
+  assert.equal((await call('GET', '/token', { headers: h, params: { 'org-slug': ORG } })).status, 200);
+  assert.equal((await call('GET', '/token', { headers: { ...h, 'X-Org-Slug': ORG }, params: { 'org-slug': 'wrong' } })).status, 200);
+  assert.equal((await call('GET', '/token', { headers: { ...h, 'X-Org-Slug': 'wrong' }, params: { 'org-slug': ORG } })).status, 401);
 });
 
 // The token is read from `Authorization: Bearer <token>` only; no assertion message carries it.
@@ -272,8 +128,8 @@ test('bearer: the scheme case-insensitively, the token trimmed; another scheme, 
     ['Bearer <token>', { ...s, 'Authorization': `Bearer ${TOKEN}` }],
     ['BEARER, two spaces, a trailing space', { ...s, 'authorization': `BEARER  ${TOKEN} ` }],
   ]) {
-    const r = await call('POST', '/add', { headers, body: BODY });
-    assert.equal(r.status, 201, `${label}: ${r.json && r.json.error}`);
+    const r = await call('GET', '/token', { headers });
+    assert.equal(r.status, 200, `${label}: ${r.json && r.json.error}`);
   }
   for (const [label, headers, params, reason] of [
     ['another scheme', { ...s, 'Authorization': `Basic ${TOKEN}` }, {}, 'token is required'],
@@ -286,28 +142,11 @@ test('bearer: the scheme case-insensitively, the token trimmed; another scheme, 
     ['a wrong token', { ...s, 'Authorization': 'Bearer wrong' }, {}, 'unknown token'],
     ['another org', { ...s, 'X-Org-Slug': 'other', 'Authorization': `Bearer ${TOKEN}` }, {}, 'org slug does not match'],
   ]) {
-    const r = await call('POST', '/add', { headers, params, body: BODY });
+    const r = await call('GET', '/token', { headers, params });
     assert.equal(r.status, 401, label);
     assert.equal(r.json.error, reason, label);
   }
 });
-
-for (const [name, header, param, field] of [
-  ['atlas-slug', 'X-Atlas-Slug', 'atlas-slug', 'atlas-slug'],
-  ['item-slug', 'X-Item-Slug', 'item-slug', 'item-slug'],
-]) {
-  test(`precedence: ${name} from header, param, header wins`, async () => {
-    const other = name === 'atlas-slug' ? { 'X-Item-Slug': 'prec-item' } : { 'X-Atlas-Slug': 'prec-atlas' };
-    const h0 = { 'X-Org-Slug': ORG, 'Authorization': `Bearer ${TOKEN}`, ...other };
-    let r = await call('POST', '/add', { headers: { ...h0, [header]: 'from-header' }, body: BODY });
-    assert.equal(r.json.record[field], 'from-header');
-    r = await call('POST', '/add', { headers: h0, params: { [param]: 'from-param' }, body: BODY });
-    assert.equal(r.json.record[field], 'from-param');
-    r = await call('POST', '/add', { headers: { ...h0, [header]: 'from-header' }, params: { [param]: 'from-param' }, body: BODY });
-    assert.equal(r.status, 201);
-    assert.equal(r.json.record[field], 'from-header');
-  });
-}
 
 test('auth: a wrong token, no token or another org is 401 with a reason', async () => {
   for (const [headers, reason] of [
@@ -315,9 +154,8 @@ test('auth: a wrong token, no token or another org is 401 with a reason', async 
     [{ 'X-Org-Slug': ORG }, 'token is required'],
     [{ 'X-Org-Slug': 'another-org', 'Authorization': `Bearer ${TOKEN}` }, 'org slug does not match'],
   ]) {
-    for (const [method, path, body] of [['GET', '/inventory'], ['POST', '/add', BODY], ['GET', '/status'],
-      ['POST', '/update', { id: 'x', what: 'x' }]]) {
-      const r = await call(method, path, { headers: { ...headers, 'X-Atlas-Slug': 'n', 'X-Item-Slug': 'i' }, body });
+    for (const [method, path] of [['GET', '/token'], ['GET', '/thirdparty']]) {
+      const r = await call(method, path, { headers });
       assert.equal(r.status, 401, `${method} ${path}`);
       assert.equal(r.json.error, reason, `${method} ${path}`);
     }
@@ -325,34 +163,30 @@ test('auth: a wrong token, no token or another org is 401 with a reason', async 
 });
 
 test('bad body is 400, unknown id 404, DELETE and unknown routes 404', async () => {
-  let r = await call('POST', '/add', { headers: auth('n', 'i'), raw: '{not json' });
+  // No route reads by an id any more; a bad body is refused by the routes that take one.
+  let r = await call('POST', '/tokens', { raw: '{not json' });
   assert.equal(r.status, 400);
   assert.equal(typeof r.json.error, 'string');
-  assert.equal((await call('POST', '/add', { headers: auth('n', 'i'), body: [1, 2] })).status, 400);
-  assert.equal((await call('POST', '/update', { headers: read('n', 'i'), raw: '' })).status, 400);
-  assert.equal((await call('GET', '/status', { headers: read('n', 'i'), params: { id: 'missing' } })).status, 404);
-  for (const path of ['/', '/add', '/update', '/status', '/inventory', '/tokens', '/emails', '/emails/active', '/elsewhere']) {
-    for (const headers of [auth('n', 'i'), asAdmin]) {
+  assert.equal((await call('POST', '/tokens', { body: [1, 2] })).status, 400);
+  assert.equal((await call('POST', '/emails', { headers: asAdmin, raw: '' })).status, 400);
+  assert.equal((await call('POST', '/emails/active', { headers: asAdmin, body: { email: 'missing@example.org', active: true } })).status, 404);
+  for (const path of ['/', '/token', '/thirdparty', '/tokens', '/emails', '/emails/active', '/elsewhere']) {
+    for (const headers of [read(), asAdmin]) {
       r = await call('DELETE', path, { headers, body: { email: HOLDER } });
       assert.equal(r.status, 404, `DELETE ${path}`);
       assert.equal(typeof r.json.error, 'string');
     }
   }
-  for (const [method, path] of [['GET', '/elsewhere'], ['GET', '/add'], ['POST', '/status'], ['PUT', '/update'], ['POST', '/'],
+  for (const [method, path] of [['GET', '/elsewhere'], ['POST', '/token'], ['PUT', '/thirdparty'], ['POST', '/'],
     ['GET', '/tokens'], ['GET', '/emails'], ['PUT', '/emails'], ['PATCH', '/emails/active'], ['POST', '/emails/delete']]) {
-    assert.equal((await call(method, path, { headers: auth('n', 'i') })).status, 404, `${method} ${path}`);
+    assert.equal((await call(method, path, { headers: read() })).status, 404, `${method} ${path}`);
   }
   assert.equal((await call('GET', '/token', { headers: read() })).status, 200, 'the listed address was not removed');
 });
 
 test("url parameters: no credential is read from one; the slugs' parameters still are", async () => {
-  const id = await addOne('urlp-atlas', 'urlp-item');
-  const slugs = { 'X-Org-Slug': ORG, 'X-Atlas-Slug': 'urlp-atlas', 'X-Item-Slug': 'urlp-item' };
+  const slugs = { 'X-Org-Slug': ORG };
   for (const [method, path, opts] of [
-    ['POST', '/add', { body: BODY }],
-    ['GET', '/status', { params: { id } }],
-    ['POST', '/update', { body: { id, what: 'changed by a parameter' } }],
-    ['GET', '/inventory', {}],
     ['GET', '/token', {}],
     ['GET', '/thirdparty', {}],
   ]) {
@@ -370,25 +204,9 @@ test("url parameters: no credential is read from one; the slugs' parameters stil
     }
   }
 
-  // The slugs as parameters beside the bearer header: all three on add, the org slug on GET /token,
-  // the atlas and item slugs on status, update and inventory.
-  const bearerOnly = bearer(TOKEN);
-  const tp = { 'atlas-slug': 'urlp-param-atlas', 'item-slug': 'urlp-param-item' };
-  let r = await call('POST', '/add', { headers: bearerOnly, params: { 'org-slug': ORG, ...tp }, body: BODY });
-  assert.equal(r.status, 201, r.json && r.json.error);
-  assert.equal(r.json.record['atlas-slug'], 'urlp-param-atlas');
-  assert.equal(r.json.record['item-slug'], 'urlp-param-item');
-  const pid = r.json.id;
-  r = await call('GET', '/status', { headers: read(), params: { ...tp, id: pid } });
-  assert.equal(r.status, 200, r.json && r.json.error);
-  assert.equal(r.json.record.id, pid);
-  r = await call('POST', '/update', { headers: read(), params: tp, body: { id: pid, what: 'changed under the parameters' } });
-  assert.equal(r.status, 200, r.json && r.json.error);
-  assert.equal(r.json.record.what, 'changed under the parameters');
-  r = await call('GET', '/inventory', { headers: read(), params: tp });
-  assert.equal(r.status, 200, r.json && r.json.error);
-  assert.deepEqual(idsOf(r.json.records), [pid]);
-  r = await call('GET', '/token', { headers: read(), params: { 'org-slug': ORG } });
+  // The org slug, the one slug left, as a parameter beside the bearer header, on GET /token and GET /thirdparty.
+  assert.equal((await call('GET', '/thirdparty', { headers: read(), params: { 'org-slug': ORG } })).status, 200);
+  let r = await call('GET', '/token', { headers: read(), params: { 'org-slug': ORG } });
   assert.equal(r.status, 200, r.json && r.json.error);
   r = await call('GET', '/token', { headers: read(), params: { 'org-slug': 'another-org' } });
   assert.equal(r.status, 401);
@@ -396,100 +214,28 @@ test("url parameters: no credential is read from one; the slugs' parameters stil
 });
 
 test('org slug: optional on a token call, refused when it differs; another org is absent', async () => {
-  const id = await addOne('org-atlas', 'org-item');
-  const h = read('org-atlas', 'org-item');
-  const routes = (rid) => [
-    ['GET', '/inventory', {}],
-    ['GET', '/status', { params: { id: rid } }],
-    ['POST', '/update', { body: { id: rid, what: 'changed under the org' } }],
-  ];
-  for (const [method, path, opts] of routes(id)) {
+  const h = read();
+  for (const [method, path] of [['GET', '/token'], ['GET', '/thirdparty']]) {
     for (const extra of [{}, { 'X-Org-Slug': ORG }]) {
-      assert.equal((await call(method, path, { ...opts, headers: { ...h, ...extra } })).status, 200, `${method} ${path}`);
+      assert.equal((await call(method, path, { headers: { ...h, ...extra } })).status, 200, `${method} ${path}`);
     }
-    assert.equal((await call(method, path, { ...opts, headers: h, params: { ...opts.params, 'org-slug': ORG } })).status, 200);
-    for (const req of [{ headers: { ...h, 'X-Org-Slug': 'another-org' } }, { headers: h, params: { ...opts.params, 'org-slug': 'another-org' } }]) {
-      const r = await call(method, path, { ...opts, ...req });
+    assert.equal((await call(method, path, { headers: h, params: { 'org-slug': ORG } })).status, 200);
+    for (const req of [{ headers: { ...h, 'X-Org-Slug': 'another-org' } }, { headers: h, params: { 'org-slug': 'another-org' } }]) {
+      const r = await call(method, path, req);
       assert.equal(r.status, 401, `${method} ${path}`);
       assert.equal(r.json.error, 'org slug does not match');
     }
   }
-
-  const db = openMain();
+  // Another org is absent: its slug opens nothing, a notice's status read included.
+  const s = await oneWay();
   try {
-    const own = db.prepare('SELECT id FROM tokens WHERE email = ?').get(HOLDER).id;
-    db.prepare(`INSERT INTO externalities
-      (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words, token_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      'other-org-1', 'another-org', 'org-atlas', 'org-item', 'not ours', 'someone else', 'elsewhere',
-      'open', new Date().toISOString(), null, null, own);
+    const t = await s.token();
+    assert.deepEqual(await s.notify(t, notice('feature/org-other', 'open')), KEPT);
+    const r = await s.statusOf(t, 'feature/org-other', { headers: { 'X-Org-Slug': 'another-org' } });
+    assert.deepEqual(r, { status: 401, json: { error: 'org slug does not match' } });
   } finally {
-    db.close();
+    await s.close();
   }
-  for (const headers of [read(), h]) {
-    const r = await call('GET', '/inventory', { headers });
-    assert.equal(r.status, 200);
-    assert.ok(!r.json.records.some((rec) => rec.id === 'other-org-1'), 'absent from the inventory');
-    assert.ok(r.json.records.every((rec) => rec['org-slug'] === ORG));
-  }
-  for (const [method, path, opts] of routes('other-org-1').slice(1)) {
-    const r = await call(method, path, { ...opts, headers: h });
-    assert.equal(r.status, 404, `${method} ${path}`);
-    assert.equal(r.json.error, 'unknown id');
-  }
-});
-
-test('inventory q: a substring of what, who-acts or how-observed, wildcards literal', async () => {
-  const item = 'q-item';
-  const rec = (what, who = 'someone', how = 'somehow') => ({ 'what': what, 'who-acts': who, 'how-observed': how });
-  const qa1 = await addOne('a', item, rec('the Quokka eats'));
-  const qa2 = await addOne('a', item, rec('plain', 'a Wombat'));
-  const qb1 = await addOne('b', item, rec('plain', 'someone', 'seen by a Platypus'));
-  const qb2 = await addOne('b', item, rec('another QUOKKA'));
-  const pct = await addOne('a', item, rec('load at 100% now'));
-  await addOne('a', item, rec('load at 1000 now'));
-  const und = await addOne('b', item, rec('key a_b here'));
-  await addOne('b', item, rec('key axb here'));
-  const bsl = await addOne('a', item, rec('path a\\b here'));
-  await addOne('a', item, rec('path ab here'));
-  const other = (await newToken()).token;
-  const find = async (token, params, atlas) => {
-    const r = await call('GET', '/inventory', { headers: byToken(token, atlas, null), params });
-    assert.equal(r.status, 200, JSON.stringify(params));
-    return idsOf(r.json.records);
-  };
-
-  assert.deepEqual(await find(TOKEN, { q: 'quokka' }), [qa1, qb2].sort(), 'what, any case');
-  assert.deepEqual(await find(TOKEN, { q: 'WOMB' }), [qa2], 'who-acts');
-  assert.deepEqual(await find(TOKEN, { q: 'tYpU' }), [qb1], 'how-observed');
-  assert.deepEqual(await find(other, { q: 'quokka' }), [], "another token's inventory holds none of them");
-
-  const r = await call('POST', '/update', { headers: read('a', item), body: { id: qa1, state: 'cleared', 'cleared-words': 'seen' } });
-  assert.equal(r.status, 200);
-  assert.deepEqual(await find(TOKEN, { q: 'quokka', state: 'open' }), [qb2]);
-  assert.deepEqual(await find(TOKEN, { q: 'quokka', state: 'cleared' }), [qa1]);
-  assert.deepEqual(await find(TOKEN, { q: 'quokka' }, 'b'), [qb2]);
-  assert.deepEqual(await find(TOKEN, { q: 'quokka' }, 'a'), [qa1]);
-
-  assert.deepEqual(await find(TOKEN, { q: '100%' }), [pct], 'a literal percent sign');
-  assert.deepEqual(await find(TOKEN, { q: 'a_b' }), [und], 'a literal underscore');
-  assert.deepEqual(await find(TOKEN, { q: 'a\\b' }), [bsl], 'a literal backslash');
-
-  const empty = await call('GET', '/inventory', { headers: read(), params: { q: '' } });
-  assert.equal(empty.status, 400);
-  assert.equal(empty.json.error, 'q must be a non-empty string');
-  const space = await call('GET', `/inventory?q=%20`, { headers: read() });
-  assert.equal(space.status, 200, 'a space is matched as sent');
-  assert.ok(space.json.records.length > 0);
-});
-
-test('the old navigation header alone is refused', async () => {
-  const r = await call('POST', '/add', { headers: auth(null, 'i', { 'X-Nav-Slug': 'n' }), body: BODY });
-  assert.equal(r.status, 400);
-  assert.equal(r.json.error, 'atlas-slug is required');
-  const p = await call('POST', '/add', { headers: auth(null, 'i'), params: { 'nav-slug': 'n' }, body: BODY });
-  assert.equal(p.status, 400);
-  assert.equal(p.json.error, 'atlas-slug is required');
 });
 
 test('the limit: a count ends one window after its first ask, per caller and for the service', () => {
@@ -758,32 +504,34 @@ test('A12: adding a known address answers 200 and changes nothing, a deactivated
 });
 
 test("A13: deactivating an address refuses its token, its asks and its variations' with no restart; activating restores the same tokens and their records", async () => {
-  await listEmail(base, 'toggle@example.org');
-  const plain = (await tokenAt(base, 'toggle@example.org')).token;
-  const varied = (await tokenAt(base, 'toggle+v@example.org')).token;
-  const ids = [];
-  for (const token of [plain, varied]) {
-    const r = await call('POST', '/add', { headers: byToken(token, 'tg', 'tg-item'), body: BODY });
+  // On the server with the notice address on, so each token keeps a notice of its own.
+  await listEmail(partBase, 'toggle@example.org');
+  const plain = (await tokenAt(partBase, 'toggle@example.org')).token;
+  const varied = (await tokenAt(partBase, 'toggle+v@example.org')).token;
+  const item = 'feature/toggle';
+  const sent = {};
+  for (const [name, token] of [['plain', plain], ['varied', varied]]) {
+    sent[name] = notice(item, 'open', { what: `sent by ${name}` });
+    const r = await at('POST', `/${PART}/notify`, { headers: bearer(token), body: sent[name] });
     assert.equal(r.status, 201, r.json && r.json.error);
-    ids.push(r.json.id);
   }
-  await activate(base, 'toggle@example.org', false);
+  await activate(partBase, 'toggle@example.org', false);
   for (const token of [plain, varied]) {
-    for (const [method, path, opts] of [['GET', '/token', {}], ['GET', '/inventory', {}], ['POST', '/add', { body: BODY }],
-      ['GET', '/status', { params: { id: ids[0] } }]]) {
-      const r = await call(method, path, { ...opts, headers: byToken(token, 'tg', 'tg-item') });
-      assert.deepEqual(r, { status: 401, json: { error: 'unknown token' } }, `${method} ${path}`);
+    for (const [method, path, opts] of [['GET', '/token', {}], ['GET', '/thirdparty', {}], ['POST', `/${PART}/notify`, { body: notice(item, 'open') }],
+      ['GET', statusPath(item), {}]]) {
+      const r = await at(method, path, { ...opts, headers: bearer(token) });
+      assert.deepEqual(r, { status: 401, json: { error: 'unknown token' } }, method);
     }
   }
   for (const email of ['toggle@example.org', 'toggle+v@example.org', 'toggle+new@example.org']) {
-    assert.deepEqual(await askAt(base, email), REFUSED, email);
+    assert.deepEqual(await askAt(partBase, email), REFUSED, email);
   }
-  await activate(base, 'toggle@example.org', true);
-  for (const [i, [email, token]] of [['toggle@example.org', plain], ['toggle+v@example.org', varied]].entries()) {
-    const inv = await call('GET', '/inventory', { headers: byToken(token) });
-    assert.equal(inv.status, 200, email);
-    assert.deepEqual(idsOf(inv.json.records), [ids[i]], `${email}: its record is back`);
-    const again = await askAt(base, email, {}, bearer(token));
+  await activate(partBase, 'toggle@example.org', true);
+  for (const [email, token, name] of [['toggle@example.org', plain, 'plain'], ['toggle+v@example.org', varied, 'varied']]) {
+    const st = await at('GET', statusPath(item), { headers: bearer(token) });
+    assert.equal(st.status, 200, email);
+    assert.deepEqual(st.json, [sent[name]], `${email}: its notice is back`);
+    const again = await askAt(partBase, email, {}, bearer(token));
     assert.equal(again.status, 200, `${email}: the same token asks again`);
     assert.ok(again.json.token !== token, `${email}: renewed`);
   }
@@ -877,11 +625,8 @@ test('A17: the service refuses to start with ADMIN_TOKEN unset or malformed, and
   assert.doesNotMatch(ok.err, /refusing/);
 });
 
+// The token routes of the route table, the four retired calls no longer among them (each now answers as an unknown route).
 const TOKEN_ROUTES = (atlas, item) => [
-  ['POST', '/add', { body: BODY }],
-  ['POST', '/update', { body: { id: 'x', what: 'x' } }],
-  ['GET', '/status', { params: { id: 'x' } }],
-  ['GET', '/inventory', {}],
   ['GET', '/token', {}],
   ['GET', '/thirdparty', {}],
 ].map(([method, path, opts]) => [method, path, { ...opts, slugs: { 'X-Atlas-Slug': atlas, 'X-Item-Slug': item } }]);
@@ -952,10 +697,11 @@ test('A21: at an open address a wrong part answers 404; the right part with no t
 });
 
 test('A22: a token adds a record and reads the third-party outcome', async () => {
-  const t = (await newToken()).token;
-  const r = await call('POST', '/add', { headers: byToken(t, 'a22', 'a22-item'), body: BODY });
+  // The record is a notice, kept on the server with the notice address on.
+  const t = (await tokenAt(partBase, variation())).token;
+  const r = await at('POST', `/${PART}/notify`, { headers: bearer(t), body: notice('feature/a22', 'open') });
   assert.equal(r.status, 201, r.json && r.json.error);
-  const o = await call('GET', '/thirdparty', { headers: bearer(t) });
+  const o = await at('GET', '/thirdparty', { headers: bearer(t) });
   assert.equal(o.status, 200, o.json && o.json.error);
   assert.deepEqual(Object.keys(o.json).sort(), ['last-delivery-date', 'last-delivery-status']);
 });
@@ -1035,14 +781,6 @@ async function addFull(atlas, item, token) {
   return r.json;
 }
 
-const assertAddShape = (r) => {
-  assert.equal(r.status, 201, JSON.stringify(r.json));
-  assert.deepEqual(Object.keys(r.json).sort(), ['id', 'record']);
-  assert.equal(r.json.record.id, r.json.id);
-  assert.deepEqual(Object.keys(r.json.record).sort(), [...FIELDS].sort());
-  assert.equal(r.json.record.state, 'open');
-};
-
 const TOKEN_FIELDS = ['date', 'last-delivery-date', 'last-delivery-status', 'url'];
 
 test("A23: a new record reaches its own token's URL once and no other token's; a token without a URL receives nothing", async () => {
@@ -1070,28 +808,6 @@ test("A23: a new record reaches its own token's URL once and no other token's; a
   }
 });
 
-test('delivery: a token with a URL receives its own add once, JSON, no auth header, the inventory record', async () => {
-  const rx = await receiver();
-  const atlas = 'dlv-own';
-  const item = 'dlv-own-item';
-  const t = await newToken(rx.url);
-  const added = await addFull(atlas, item, t.token);
-  const outcome = await settled(t.token);
-  const got = rx.withId(added.id);
-  assert.equal(got.length, 1, 'exactly one request with the id');
-  assert.ok(String(got[0].headers['content-type']).startsWith('application/json'), got[0].headers['content-type']);
-  assert.equal('authorization' in got[0].headers, false, 'no auth header');
-  const body = JSON.parse(got[0].body);
-  assert.deepEqual(body, added.record, 'the add response record');
-  const inv = await call('GET', '/inventory', { headers: byToken(t.token, atlas, item) });
-  assert.equal(inv.status, 200);
-  const fromInventory = inv.json.records.find((rec) => rec.id === added.id);
-  assert.ok(fromInventory, 'inventory lists the record');
-  assert.deepEqual(body, fromInventory, 'the inventory record');
-  assert.equal(outcome['last-delivery-status'], 200);
-  assert.match(outcome['last-delivery-date'], ISO);
-});
-
 test('delivery: a token without a URL stays at nulls', async () => {
   const t = await newToken();
   assert.equal(t.url, null);
@@ -1117,43 +833,37 @@ test('delivery: a receiver answering 500 stores 500 and is called once', async (
 });
 
 test('delivery: a never-answering receiver stores 0, connected once, the add answering 201 first', async () => {
+  // The delivery is the forwarding of a notice, on a server with the notice address on and loopback exempt.
   const rx = await receiver(null);
-  const t = await newToken(rx.url);
-  const started = performance.now();
-  const r = await call('POST', '/add', { headers: byToken(t.token, 'dlv-silent', 'dlv-silent-item'), body: BODY });
-  const elapsed = performance.now() - started;
-  assertAddShape(r);
-  assert.ok(elapsed < DELIVERY_TIMEOUT, `the add answered in ${Math.round(elapsed)} ms, before the timeout`);
-  const outcome = await settled(t.token);
-  assert.equal(outcome['last-delivery-status'], 0);
-  assert.match(outcome['last-delivery-date'], ISO);
-  assert.equal(rx.withId(r.json.id).length, 1, 'one request');
-  assert.equal(rx.sockets.size, 1, 'connected once');
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    const started = performance.now();
+    const r = await s.notify(t, notice('feature/dlv-silent', 'open'));
+    const elapsed = performance.now() - started;
+    assert.deepEqual(r, KEPT);
+    assert.ok(elapsed < DELIVERY_TIMEOUT, `the notice answered in ${Math.round(elapsed)} ms, before the timeout`);
+    const outcome = await forwarded(s, t);
+    assert.equal(outcome['last-delivery-status'], 0);
+    assert.match(outcome['last-delivery-date'], ISO);
+    assert.equal(rx.requests.length, 1, 'one request');
+    assert.equal(rx.sockets.size, 1, 'connected once');
+  } finally {
+    await s.close();
+  }
 });
 
 test('delivery: a closed port stores 0 and the add answers 201 in shape', async () => {
-  const t = await newToken(await closedPortUrl());
-  const r = await call('POST', '/add', { headers: byToken(t.token, 'dlv-closed', 'dlv-closed-item'), body: BODY });
-  assertAddShape(r);
-  const outcome = await settled(t.token);
-  assert.equal(outcome['last-delivery-status'], 0);
-  assert.match(outcome['last-delivery-date'], ISO);
-});
-
-test('delivery: an update is not re-sent', async () => {
-  const rx = await receiver();
-  const atlas = 'dlv-update';
-  const item = 'dlv-update-item';
-  const t = await newToken(rx.url);
-  const added = await addFull(atlas, item, t.token);
-  await settled(t.token);
-  assert.equal(rx.withId(added.id).length, 1);
-  const u = await call('POST', '/update', { headers: byToken(t.token, atlas, item), body: { id: added.id, what: 'changed after the delivery' } });
-  assert.equal(u.status, 200, u.json && u.json.error);
-  assert.equal(u.json.record.what, 'changed after the delivery');
-  await sleep(NEGATIVE_WAIT);
-  assert.equal(rx.withId(added.id).length, 1, 'the update was not re-sent');
-  assert.equal(rx.requests.length, 1);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(await closedPortUrl());
+    assert.deepEqual(await s.notify(t, notice('feature/dlv-closed', 'open')), KEPT, 'the notice answers 201 in shape');
+    const outcome = await forwarded(s, t);
+    assert.equal(outcome['last-delivery-status'], 0);
+    assert.match(outcome['last-delivery-date'], ISO);
+  } finally {
+    await s.close();
+  }
 });
 
 test('delivery: a second add overwrites the outcome', async () => {
@@ -1289,10 +999,10 @@ test('addresses: off without ADDRESS_KEY, both answering as an unknown route', a
 });
 
 test('addresses: on with ADDRESS_KEY, both answer; the present routes still answer', async () => {
-  assert.deepEqual(Object.keys(await post(notice('feature/on', 'open'))), ['id']);
+  assert.deepEqual(await post(notice('feature/on', 'open')), { kept: true });
   assert.equal((await statusOf('feature/on')).length, 1);
   assert.equal((await at('GET', '/', { headers: {} })).status, 200);
-  assert.deepEqual(await at('GET', '/inventory', { headers: {} }), { status: 401, json: { error: 'token is required' } });
+  assert.deepEqual(await at('GET', '/token', { headers: {} }), { status: 401, json: { error: 'token is required' } });
 });
 
 test('addresses: a wrong part, another method or a near path answers as an unknown route', async () => {
@@ -1438,55 +1148,23 @@ test('status: an unknown reference is an empty list; a missing or empty one is r
   }
 });
 
-test('status: a record added by POST /add stays on inventory and is in no status read', async () => {
-  const item = 'feature/old-kind';
-  const r = await at('POST', '/add', { headers: byToken(PART_TOKEN, 'none', item), body: BODY });
-  assert.equal(r.status, 201, JSON.stringify(r.json));
-  assert.deepEqual(await statusOf(item), []);
-  const inv = await at('GET', '/inventory', { headers: byToken(PART_TOKEN, 'none', item) });
-  assert.equal(inv.status, 200);
-  assert.deepEqual(inv.json.records.map((rec) => rec.id), [r.json.id]);
-});
-
-test('notify: a notice reaches no token address', async () => {
-  const rx = await receiver();
-  const t = await tokenAt(partBase, 'holder+rx@example.org', { url: rx.url });
-  const added = await at('POST', '/add', { headers: byToken(t.token, 'none', 'feature/no-delivery'), body: BODY });
-  assert.equal(added.status, 201);
-  for (let i = 0; i < 60 && rx.requests.length === 0; i++) await sleep(50);
-  assert.equal(rx.withId(added.json.id).length, 1, 'positive control: the add was delivered');
-  const kept = await at('POST', `/${PART}/notify`, { headers: bearer(t.token), body: notice('feature/no-delivery', 'open') });
-  assert.equal(kept.status, 201);
-  await sleep(NEGATIVE_WAIT);
-  assert.equal(rx.requests.length, 1, 'the notice was not delivered');
-  assert.equal(rx.withId(kept.json.id).length, 0);
-});
-
 test("A24: an authorized address's token and its variation's each add a record and send a notice; neither reads, lists or changes the other's", async () => {
+  // The record and the notice are one now: each token sends notices, and no call changes a kept one.
   await listEmail(partBase, 'pair@example.org');
   const p = (await tokenAt(partBase, 'pair@example.org')).token;
   const v = (await tokenAt(partBase, 'pair+v@example.org')).token;
-  const atlas = 'a24';
   const item = 'feature/a24';
-  const ids = {};
   const notices = {};
   for (const [name, token] of [['p', p], ['v', v]]) {
-    const r = await at('POST', '/add', { headers: byToken(token, atlas, item), body: { ...BODY, what: `made by ${name}` } });
-    assert.equal(r.status, 201, r.json && r.json.error);
-    ids[name] = r.json.id;
-    notices[name] = notice(item, 'open', { what: `sent by ${name}` });
-    assert.equal((await at('POST', `/${PART}/notify`, { headers: bearer(token), body: notices[name] })).status, 201);
+    notices[name] = [notice(item, 'open', { what: `sent by ${name}` }), notice(item, 'cleared', { what: `sent by ${name}` })];
+    for (const sent of notices[name]) {
+      assert.equal((await at('POST', `/${PART}/notify`, { headers: bearer(token), body: sent })).status, 201);
+      await sleep(5);
+    }
   }
-  for (const [mine, other, token] of [['p', 'v', p], ['v', 'p', v]]) {
-    const h = byToken(token, atlas, item);
-    const inv = await at('GET', '/inventory', { headers: byToken(token) });
-    assert.deepEqual(idsOf(inv.json.records), [ids[mine]], `${mine} lists its own only`);
-    assert.deepEqual(await at('GET', '/status', { headers: h, params: { id: ids[other] } }), { status: 404, json: { error: 'unknown id' } }, `${mine} reads`);
-    assert.deepEqual(await at('POST', '/update', { headers: h, body: { id: ids[other], what: 'changed by the other' } }),
-      { status: 404, json: { error: 'unknown id' } }, `${mine} changes`);
-    assert.deepEqual((await at('GET', statusPath(item), { headers: bearer(token) })).json, [notices[mine]], `${mine} reads its own notices only`);
-    const own = await at('GET', '/status', { headers: h, params: { id: ids[mine] } });
-    assert.equal(own.json.record.what, `made by ${mine}`, `${mine}'s record unchanged`);
+  for (const [mine, token] of [['p', p], ['v', v]]) {
+    const st = await at('GET', statusPath(item), { headers: bearer(token) });
+    assert.deepEqual(st.json, [...notices[mine]].reverse(), `${mine} reads its own notices only, each unchanged`);
   }
 });
 
@@ -1820,26 +1498,6 @@ test('GET /thirdparty: refused without a valid token; null at first, the latest 
   }
 });
 
-test('thirdparty: a notice with an address reaches no token address', async () => {
-  const third = await receiver();
-  const tokenRx = await receiver();
-  const s = await tpServer('127.0.0.1');
-  try {
-    const t = await tokenAt(s.base, 'holder+rx@example.org', { url: tokenRx.url });
-    const added = await s.req('POST', '/add', { headers: byToken(t.token, 'none', 'feature/tp-token'), raw: JSON.stringify(BODY) });
-    assert.equal(added.status, 201);
-    for (let i = 0; i < 60 && tokenRx.requests.length === 0; i++) await sleep(50);
-    assert.equal(tokenRx.withId(added.json.id).length, 1, 'positive control: the add was delivered');
-    assert.equal((await s.notify(tpNotice('feature/tp-token', 'open', third.url), bearer(t.token))).status, 201);
-    await tpSettled(s);
-    await sleep(NEGATIVE_WAIT);
-    assert.equal(third.requests.length, 1, 'the third party got the notice');
-    assert.equal(tokenRx.requests.length, 1, 'the token address got nothing more');
-  } finally {
-    await s.close();
-  }
-});
-
 // The loop guard: every post carries `x-externality-passed-on: 1`; a notice arriving with it is kept, never passed on.
 const PASSED = 'x-externality-passed-on';
 
@@ -2012,9 +1670,7 @@ test('A26: POST /tokens ignores a scope; GET /token returns none', async () => {
   } finally {
     db.close();
   }
-  const added = await addFull('an-atlas-not-named', 'a26-item', token);
-  const inv = await call('GET', '/inventory', { headers: byToken(token) });
-  assert.deepEqual(idsOf(inv.json.records), [added.id], 'records are the token\'s, under any atlas');
+  assert.equal((await call('GET', '/thirdparty', { headers: bearer(token) })).status, 200, 'the token opens its routes, under no atlas');
 });
 
 // A database in the shape the old code made: its tables and columns, a row in each.
@@ -2060,28 +1716,27 @@ test('A27: a database made by the old code opens under the new code with its rec
   oldDatabase(dir);
   const s = await startOn(dir);
   try {
-    assert.deepEqual(s.lines, [DROPPED], 'one line naming the three tables');
+    assert.deepEqual(s.lines, [DROPPED], 'one line naming the three tables, and no second line');
     const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
     try {
-      for (const table of ['externalities', 'notices', 'tokens', 'authorized_emails']) {
+      assert.equal(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'externalities'").get().n, 0,
+        'the records are gone with their table');
+      for (const table of ['notices', 'tokens', 'authorized_emails']) {
         assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 0, `${table} is empty`);
       }
       assert.ok(!db.prepare('PRAGMA table_info(tokens)').all().some((c) => c.name === 'scope'), 'tokens made new');
-      for (const table of ['externalities', 'notices']) {
-        assert.ok(db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === 'token_id'), `${table} made new`);
-      }
+      assert.ok(db.prepare('PRAGMA table_info(notices)').all().some((c) => c.name === 'token_id'), 'notices made new');
       assert.deepEqual({ ...db.prepare('SELECT * FROM thirdparty').get() },
         { id: 1, last_delivery_date: '2026-11-01T00:00:00.000Z', last_delivery_status: 204 }, 'the third-party outcome is kept');
     } finally {
       db.close();
     }
-    assert.deepEqual(await request(s.base, 'GET', '/inventory', { headers: bearer('old-token-value-0123456789') }),
+    assert.deepEqual(await request(s.base, 'GET', '/token', { headers: bearer('old-token-value-0123456789') }),
       { status: 401, json: { error: 'unknown token' } }, 'the old token opens nothing');
     await listEmail(s.base, HOLDER);
     const token = (await tokenAt(s.base, HOLDER)).token;
     assert.deepEqual((await request(s.base, 'GET', '/thirdparty', { headers: bearer(token) })).json,
       { 'last-delivery-date': '2026-11-01T00:00:00.000Z', 'last-delivery-status': 204 });
-    assert.deepEqual((await request(s.base, 'GET', '/inventory', { headers: bearer(token) })).json, { records: [] });
   } finally {
     await s.close();
   }
@@ -2106,38 +1761,35 @@ test('the old shape without a tokens table: records and notices dropped once, th
   } finally {
     old.close();
   }
-  let s = await startOn(dir);
+  // The records made after are notices, kept on a server with the notice address on.
+  let s = await oneWay({ dir, list: false });
   let token;
-  let id;
+  const sent = notice('feature/between', 'open');
   try {
     assert.deepEqual(s.lines, [DROPPED], 'the one line, once');
     const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
     try {
-      for (const table of ['externalities', 'notices', 'tokens']) {
+      assert.equal(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'externalities'").get().n, 0,
+        'the records are gone with their table');
+      for (const table of ['notices', 'tokens']) {
         assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 0, `${table} is empty`);
       }
-      for (const table of ['externalities', 'notices']) {
-        assert.ok(db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === 'token_id'), `${table} made new`);
-      }
+      assert.ok(db.prepare('PRAGMA table_info(notices)').all().some((c) => c.name === 'token_id'), 'notices made new');
       assert.equal(db.prepare('SELECT last_delivery_status AS s FROM thirdparty').get().s, 202, 'the third-party outcome is kept');
     } finally {
       db.close();
     }
     await listEmail(s.base, HOLDER);
     token = (await tokenAt(s.base, HOLDER)).token;
-    const r = await request(s.base, 'POST', '/add', { headers: byToken(token, 'between', 'between-item'), body: BODY });
-    assert.equal(r.status, 201, r.json && r.json.error);
-    id = r.json.id;
+    assert.deepEqual(await s.notify(token, sent), KEPT);
   } finally {
     await s.close();
   }
-  s = await startOn(dir);
+  s = await oneWay({ dir, list: false });
   try {
     assert.deepEqual(s.lines, [], 'a second open drops nothing');
-    const inv = await request(s.base, 'GET', '/inventory', { headers: byToken(token) });
-    assert.equal(inv.status, 200);
-    assert.deepEqual(idsOf(inv.json.records), [id], 'the record made in between is kept');
-    assert.deepEqual((await request(s.base, 'GET', '/thirdparty', { headers: bearer(token) })).json,
+    assert.deepEqual(await s.statusOf(token, 'feature/between'), { status: 200, json: [sent] }, 'the notice made in between is kept');
+    assert.deepEqual((await s.outcome(token)).json,
       { 'last-delivery-date': '2026-11-02T00:00:00.000Z', 'last-delivery-status': 202 });
   } finally {
     await s.close();
@@ -2145,29 +1797,25 @@ test('the old shape without a tokens table: records and notices dropped once, th
 });
 
 test('A28: records made after that survive a restart', async () => {
+  // The records made after are notices, kept on a server with the notice address on.
   const dir = mkdtempSync(join(dataDir, 'old-'));
   oldDatabase(dir);
-  let s = await startOn(dir);
+  let s = await oneWay({ dir, list: false });
   let token;
-  let id;
+  const sent = notice('feature/after', 'open');
   try {
     assert.deepEqual(s.lines, [DROPPED]);
     await listEmail(s.base, HOLDER);
     token = (await tokenAt(s.base, HOLDER)).token;
-    const r = await request(s.base, 'POST', '/add', { headers: byToken(token, 'after', 'after-item'), body: BODY });
-    assert.equal(r.status, 201, r.json && r.json.error);
-    id = r.json.id;
+    assert.deepEqual(await s.notify(token, sent), KEPT);
   } finally {
     await s.close();
   }
-  s = await startOn(dir);
+  s = await oneWay({ dir, list: false });
   try {
     assert.deepEqual(s.lines, [], 'a later start drops nothing');
-    const inv = await request(s.base, 'GET', '/inventory', { headers: byToken(token) });
-    assert.equal(inv.status, 200, 'the token survives the restart');
-    assert.deepEqual(idsOf(inv.json.records), [id], 'the record survives the restart');
-    const st = await request(s.base, 'GET', '/status', { headers: byToken(token, 'after', 'after-item'), params: { id } });
-    assert.equal(st.json.record.what, BODY.what);
+    assert.equal((await s.tokenInfo(token)).status, 200, 'the token survives the restart');
+    assert.deepEqual(await s.statusOf(token, 'feature/after'), { status: 200, json: [sent] }, 'the notice survives the restart');
   } finally {
     await s.close();
   }
@@ -2215,13 +1863,16 @@ test('re-call A2: a later ask with another address\'s token, a variation\'s, the
 
 test('re-call A3: after a refused later ask the token still opens its routes; its URL, record and notice stand', async () => {
   const email = 'recall-a3@example.org';
-  const url = 'https://example.org/recall-a3';
+  // A forwarding address the guard refuses (loopback, no exemption on this server): the notice's forwarding sends
+  // nothing anywhere and settles at once with status 0, before the row is read.
+  const url = 'http://127.0.0.1:1/recall-a3';
   await listEmail(partBase, email);
   const t = (await tokenAt(partBase, email, { url })).token;
-  const added = await request(partBase, 'POST', '/add', { headers: byToken(t, 'rc3', 'rc3-item'), body: BODY });
-  assert.equal(added.status, 201, added.json && added.json.error);
   const item = 'feature/recall-a3';
   assert.equal((await at('POST', `/${PART}/notify`, { headers: bearer(t), body: notice(item, 'open') })).status, 201);
+  let settledInfo;
+  await waitFor(async () => (settledInfo = (await request(partBase, 'GET', '/token', { headers: bearer(t) })).json)['last-delivery-date'] !== null);
+  assert.equal(settledInfo['last-delivery-status'], 0, 'the record of the forwarding: refused, status 0');
   const rowOf = () => {
     const db = new DatabaseSync(join(partDir, 'externalities.sqlite'));
     try {
@@ -2243,8 +1894,7 @@ test('re-call A3: after a refused later ask the token still opens its routes; it
   const info = await request(partBase, 'GET', '/token', { headers: bearer(t) });
   assert.equal(info.status, 200, 'the token still opens its routes');
   assert.equal(info.json.url, url, 'the URL stands');
-  const inv = await request(partBase, 'GET', '/inventory', { headers: bearer(t) });
-  assert.deepEqual(idsOf(inv.json.records), [added.json.id], 'the record stands');
+  assert.equal(info.json['last-delivery-date'], settledInfo['last-delivery-date'], 'the record of the forwarding stands');
   const st = await at('GET', statusPath(item), { headers: bearer(t) });
   assert.deepEqual(st, { status: 200, json: [notice(item, 'open')] }, 'the notice stands');
 });
@@ -2298,35 +1948,30 @@ test('re-call A5: the old token then answers 401 on every token route and at the
 });
 
 test('re-call A6: a record and a notice made with the old token are read with the new; so are the URL and the delivery outcome', async () => {
+  // The record is a notice; its delivery is the notice's forwarding, on a server with loopback exempt.
   const email = 'recall-a6@example.org';
-  await listEmail(partBase, email);
   const rx = await receiver();
-  const old = (await tokenAt(partBase, email, { url: rx.url })).token;
-  const added = await request(partBase, 'POST', '/add', { headers: byToken(old, 'rc6', 'rc6-item'), body: BODY });
-  assert.equal(added.status, 201, added.json && added.json.error);
-  let outcome;
-  for (let i = 0; i < 60; i++) {
-    outcome = (await request(partBase, 'GET', '/token', { headers: bearer(old) })).json;
-    if (outcome['last-delivery-date'] !== null) break;
-    await sleep(50);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    await listEmail(s.base, email);
+    const old = (await tokenAt(s.base, email, { url: rx.url })).token;
+    const item = 'feature/recall-a6';
+    assert.deepEqual(await s.notify(old, notice(item, 'open')), KEPT);
+    const outcome = await forwarded(s, old);
+    assert.equal(outcome['last-delivery-status'], 200, 'the delivery settled');
+    const r = await askAt(s.base, email, {}, bearer(old));
+    assert.equal(r.status, 200, r.json && r.json.error);
+    const fresh = r.json.token;
+    assert.equal(r.json.url, rx.url, 'the answer carries the kept URL');
+    const info = await s.tokenInfo(fresh);
+    assert.equal(info.status, 200);
+    assert.equal(info.json.url, rx.url, 'the URL');
+    assert.equal(info.json['last-delivery-date'], outcome['last-delivery-date'], 'the delivery date');
+    assert.equal(info.json['last-delivery-status'], outcome['last-delivery-status'], 'the delivery status');
+    assert.deepEqual(await s.statusOf(fresh, item), { status: 200, json: [notice(item, 'open')] }, 'the notice');
+  } finally {
+    await s.close();
   }
-  assert.equal(outcome['last-delivery-status'], 200, 'the delivery settled');
-  const item = 'feature/recall-a6';
-  assert.equal((await at('POST', `/${PART}/notify`, { headers: bearer(old), body: notice(item, 'open') })).status, 201);
-  const r = await askAt(partBase, email, {}, bearer(old));
-  assert.equal(r.status, 200, r.json && r.json.error);
-  const fresh = r.json.token;
-  assert.equal(r.json.url, rx.url, 'the answer carries the kept URL');
-  const info = await request(partBase, 'GET', '/token', { headers: bearer(fresh) });
-  assert.equal(info.status, 200);
-  assert.equal(info.json.url, rx.url, 'the URL');
-  assert.equal(info.json['last-delivery-date'], outcome['last-delivery-date'], 'the delivery date');
-  assert.equal(info.json['last-delivery-status'], outcome['last-delivery-status'], 'the delivery status');
-  const inv = await request(partBase, 'GET', '/inventory', { headers: bearer(fresh) });
-  assert.deepEqual(idsOf(inv.json.records), [added.json.id], 'the record');
-  const st = await request(partBase, 'GET', '/status', { headers: byToken(fresh, 'rc6', 'rc6-item'), params: { id: added.json.id } });
-  assert.equal(st.status, 200, 'the record by its id');
-  assert.deepEqual(await at('GET', statusPath(item), { headers: bearer(fresh) }), { status: 200, json: [notice(item, 'open')] }, 'the notice');
 });
 
 test('re-call A7: a later ask naming a URL stores it, with no url keeps it, naming null clears it; each answer carries url', async () => {
@@ -2476,22 +2121,19 @@ test('re-call A11: a deactivated address\'s later ask with the right token is re
 test('re-call A12: a database made by the service\'s own openDb and filled as the shipped code holds it opens with every row kept and no dropped line', async () => {
   const dir = mkdtempSync(join(dataDir, 'recall-'));
   const held = randomBytes(32).toString('base64url');
-  // The tables made by src/db.js, which this change leaves as it is: no table and no column added.
+  // The tables made by src/db.js, the add store no longer among them; dates recent, so no notice is past its 90 days.
   const made = openDb({ DATA_DIR: dir });
   try {
     made.prepare('INSERT INTO authorized_emails (id, email, active) VALUES (1, ?, 1)').run(HOLDER);
     made.prepare('INSERT INTO tokens (id, email, token, authorized_email, url, date, last_delivery_date, last_delivery_status) VALUES (1, ?, ?, 1, ?, ?, ?, ?)')
-      .run(HOLDER, held, 'https://example.org/kept', '2026-11-18T10:00:00.000Z', '2026-11-18T10:05:00.000Z', 200);
-    made.prepare(`INSERT INTO externalities (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words, token_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`).run('kept-1', ORG, 'kept-atlas', 'kept-item', 'kept before', 'someone', 'somehow', 'open',
-      '2026-11-18T10:01:00.000Z', null, null);
+      .run(HOLDER, held, 'https://example.org/kept', ago(3 * DAY_MS), ago(3 * DAY_MS - 300_000), 200);
     made.prepare('INSERT INTO notices (id, item, state, what, body, received, token_id) VALUES (?, ?, ?, ?, ?, ?, 1)')
-      .run('kept-n1', 'feature/kept', 'open', 'w', '{"item":"feature/kept","state":"open","what":"w"}', '2026-11-18T10:02:00.000Z');
-    made.prepare('INSERT INTO thirdparty (id, last_delivery_date, last_delivery_status) VALUES (1, ?, ?)').run('2026-11-18T10:03:00.000Z', 204);
+      .run('kept-n1', 'feature/kept', 'open', 'w', '{"item":"feature/kept","state":"open","what":"w"}', ago(3 * DAY_MS - 120_000));
+    made.prepare('INSERT INTO thirdparty (id, last_delivery_date, last_delivery_status) VALUES (1, ?, ?)').run(ago(3 * DAY_MS - 180_000), 204);
   } finally {
     made.close();
   }
-  const TABLES = ['authorized_emails', 'tokens', 'externalities', 'notices', 'thirdparty'];
+  const TABLES = ['authorized_emails', 'tokens', 'notices', 'thirdparty'];
   const rows = () => {
     const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
     try {
@@ -2501,18 +2143,18 @@ test('re-call A12: a database made by the service\'s own openDb and filled as th
     }
   };
   const before = rows();
-  const s = await startOn(dir);
+  const s = await oneWay({ dir, list: false });
+  const kept = [{ item: 'feature/kept', state: 'open', what: 'w' }];
   try {
     assert.deepEqual(s.lines, [], 'no dropped line');
     assert.deepEqual(rows(), before, 'every row kept');
-    const inv = await request(s.base, 'GET', '/inventory', { headers: bearer(held) });
-    assert.equal(inv.status, 200, 'the token held from before opens a token route');
-    assert.deepEqual(idsOf(inv.json.records), ['kept-1']);
+    const st = await s.statusOf(held, 'feature/kept');
+    assert.equal(st.status, 200, 'the token held from before opens a token route');
+    assert.deepEqual(st.json, kept);
     const r = await askAt(s.base, HOLDER, {}, bearer(held));
     assert.equal(r.status, 200, 'the held token renews');
     assert.equal(r.json.url, 'https://example.org/kept', 'its URL kept');
-    const again = await request(s.base, 'GET', '/inventory', { headers: bearer(r.json.token) });
-    assert.deepEqual(idsOf(again.json.records), ['kept-1'], 'the record passes to the new token');
+    assert.deepEqual((await s.statusOf(r.json.token, 'feature/kept')).json, kept, 'the notice passes to the new token');
   } finally {
     await s.close();
   }
