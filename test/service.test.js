@@ -706,7 +706,8 @@ test('A22: a token adds a record and reads the third-party outcome', async () =>
   assert.deepEqual(Object.keys(o.json).sort(), ['last-delivery-date', 'last-delivery-status']);
 });
 
-// Delivery: an add POSTed once to the URL of the token that made it. Each test asks its own token with its own receiver.
+// Delivery: a notice POSTed once to the forwarding address of the token that sent it. Each test asks its own token with
+// its own receiver.
 // No assertion message below carries a token.
 
 const receivers = [];
@@ -728,7 +729,7 @@ const idOfBody = (body) => {
 
 // A local receiver on port 0: records each request's headers and body, and the connections that carried a
 // request (the platform's fetch may open an empty one after an abort, which carries none); answers `status`,
-// or never answers (the socket held open) when `status` is null. `status` may be changed between adds.
+// or never answers (the socket held open) when `status` is null. `status` may be changed between notices.
 async function receiver(status = 200) {
   const r = { requests: [], sockets: new Set(), status };
   r.server = http.createServer((req, res) => {
@@ -2764,11 +2765,14 @@ test('one-way A25: a notice of 90 days and a minute is deleted when a notice is 
   try {
     const a = await s.token();
     const b = await s.token();
+    // The new notice is kept under a third token, so the old one under a must be deleted by another token's notice.
+    await listEmail(s.base, 'ow-a25-other@example.org');
+    const c = (await tokenAt(s.base, 'ow-a25-other@example.org')).token;
     const old = plant(s.file, 'ow-a25-old', 'feature/ow-a25', ago(90 * DAY_MS + 60_000), s.tokenId(a));
     const young = plant(s.file, 'ow-a25-young', 'feature/ow-a25', ago(90 * DAY_MS - 60_000), s.tokenId(b));
     assert.deepEqual((await s.statusOf(a, 'feature/ow-a25')).json, [old], 'the old one is there before');
     assert.deepEqual((await s.statusOf(b, 'feature/ow-a25')).json, [young]);
-    assert.equal((await s.notify(a, notice('feature/ow-a25-new', 'open'))).status, 201);
+    assert.equal((await s.notify(c, notice('feature/ow-a25-new', 'open'))).status, 201);
     assert.deepEqual((await s.statusOf(a, 'feature/ow-a25')).json, [], 'more than 90 days: gone');
     assert.deepEqual((await s.statusOf(b, 'feature/ow-a25')).json, [young], 'less than 90 days, under another token: read');
     assert.deepEqual(noticeIds(s.file).filter((id) => id.startsWith('ow-a25')), ['ow-a25-young']);
