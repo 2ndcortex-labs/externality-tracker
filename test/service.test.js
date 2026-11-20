@@ -1,13 +1,13 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { createServer } from '../src/server.js';
 import { timeoutMs } from '../src/deliver.js';
 import { loadAddressKey, loadAdminToken } from '../src/auth.js';
@@ -2513,6 +2513,752 @@ test('re-call A12: a database made by the service\'s own openDb and filled as th
     assert.equal(r.json.url, 'https://example.org/kept', 'its URL kept');
     const again = await request(s.base, 'GET', '/inventory', { headers: bearer(r.json.token) });
     assert.deepEqual(idsOf(again.json.records), ['kept-1'], 'the record passes to the new token');
+  } finally {
+    await s.close();
+  }
+});
+
+// Notice is the one way in: the cases one-way A1 to A30, one or more per acceptance criterion of the work item
+// todo/notice-is-the-one-way-in-and-add-is-retired. Every address is a made-up one at example.org; no assertion message
+// carries a part or a token. Each server here runs on its own data folder inside the first server's (removed with it).
+
+const RETIRED = [
+  ['POST', '/add', { body: BODY }],
+  ['POST', '/update', { body: { id: 'x', what: 'x' } }],
+  ['GET', '/status', { params: { id: 'x' } }],
+  ['GET', '/inventory', {}],
+];
+const DROPPED_ONE = 'externality-tracker: dropped old table externalities';
+const DAY_MS = 24 * 60 * 60 * 1000;
+const ago = (ms) => new Date(Date.now() - ms).toISOString();
+const KEPT = { status: 201, json: { kept: true } };
+
+// Polls `check` every 50 ms, up to 3 s, until it holds; never fails by itself, so the assertion after it decides.
+async function waitFor(check) {
+  for (let i = 0; i < 60 && !(await check()); i++) await sleep(50);
+}
+
+// A server with its notice address on. `allow` is THIRDPARTY_ALLOW (undefined: unset), `env` adds variables, `dir` reuses
+// a data folder, `list` lists HOLDER. The lines the server writes to the log at start are caught in `lines`.
+async function oneWay({ allow, env = {}, dir, list = true } = {}) {
+  const part = randomBytes(32).toString('base64url');
+  const folder = dir ?? mkdtempSync(join(dataDir, 'one-way-'));
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => lines.push(args.join(' '));
+  let s;
+  try {
+    s = createServer({ ORG_SLUG: ORG, ADMIN_TOKEN: ADMIN, ADDRESS_KEY: part, DATA_DIR: folder,
+      DELIVERY_TIMEOUT_MS: String(DELIVERY_TIMEOUT), ...(allow === undefined ? {} : { THIRDPARTY_ALLOW: allow }), ...env },
+    { limits: ROOMY });
+  } finally {
+    console.log = log;
+  }
+  const b = await listenOn(s);
+  if (list) await listEmail(b, HOLDER);
+  let n = 0;
+  const file = join(folder, 'externalities.sqlite');
+  return {
+    base: b, dir: folder, file, lines,
+    req: (method, path, opts) => request(b, method, path, opts),
+    // A token of its own: a new variation of HOLDER, naming `url` as its forwarding address when given.
+    token: async (url) => (await tokenAt(b, `holder+ow${++n}@example.org`, url === undefined ? {} : { url })).token,
+    tokenId: (token) => {
+      const db = new DatabaseSync(file);
+      try {
+        return db.prepare('SELECT id FROM tokens WHERE token = ?').get(token).id;
+      } finally {
+        db.close();
+      }
+    },
+    notify: (token, body, headers = {}) => request(b, 'POST', `/${part}/notify`,
+      { headers: { ...bearer(token), ...headers }, ...(typeof body === 'string' ? { raw: body } : { body }) }),
+    statusOf: (token, item, opts = {}) => request(b, 'GET', `/${part}/status?item=${encodeURIComponent(item)}`,
+      { ...opts, headers: { ...bearer(token), ...opts.headers } }),
+    tokenInfo: (token) => request(b, 'GET', '/token', { headers: bearer(token) }),
+    outcome: (token) => request(b, 'GET', '/thirdparty', { headers: bearer(token) }),
+    close: async () => { s.closeAllConnections(); await new Promise((resolve) => s.close(resolve)); },
+  };
+}
+
+// The token's own delivery outcome once one has settled (`done`), else as it stands after 3 s.
+async function forwarded(s, token, done = (t) => t['last-delivery-date'] !== null) {
+  let info;
+  await waitFor(async () => done((info = (await s.tokenInfo(token)).json)));
+  return info;
+}
+
+// Writes a notice row straight into a server's database, received at `received`, under the token row `tokenId`.
+function plant(file, id, item, received, tokenId, extra = {}) {
+  const db = new DatabaseSync(file);
+  try {
+    const body = JSON.stringify({ item, state: 'open', what: 'w', id, ...extra });
+    db.prepare('INSERT INTO notices (id, item, state, what, body, received, token_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(id, item, 'open', 'w', body, received, tokenId);
+    return JSON.parse(body);
+  } finally {
+    db.close();
+  }
+}
+
+const noticeIds = (file) => {
+  const db = new DatabaseSync(file);
+  try {
+    return db.prepare('SELECT id FROM notices ORDER BY id').all().map((r) => r.id);
+  } finally {
+    db.close();
+  }
+};
+
+// A database in the shape the code at 792a883 made it, the add store `externalities` among its tables, a row in each.
+// Returns the token held in it (never printed).
+function addStoreDatabase(dir) {
+  const held = randomBytes(32).toString('base64url');
+  const db = new DatabaseSync(join(dir, 'externalities.sqlite'));
+  try {
+    db.exec(`CREATE TABLE authorized_emails (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+      active INTEGER NOT NULL DEFAULT 1)`);
+    db.exec(`CREATE TABLE tokens (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, token TEXT NOT NULL UNIQUE,
+      authorized_email INTEGER NOT NULL REFERENCES authorized_emails(id), url TEXT, date TEXT NOT NULL,
+      last_delivery_date TEXT, last_delivery_status INTEGER)`);
+    db.exec(`CREATE TABLE externalities (
+      id TEXT PRIMARY KEY, org TEXT, atlas TEXT, item TEXT, what TEXT,
+      who_acts TEXT, how_observed TEXT, state TEXT, set_date TEXT,
+      cleared_date TEXT, cleared_words TEXT, token_id INTEGER NOT NULL REFERENCES tokens(id))`);
+    db.exec(`CREATE TABLE notices (id TEXT PRIMARY KEY, item TEXT, state TEXT, what TEXT, body TEXT, received TEXT,
+      token_id INTEGER NOT NULL REFERENCES tokens(id))`);
+    db.exec('CREATE TABLE thirdparty (id INTEGER PRIMARY KEY CHECK (id = 1), last_delivery_date TEXT, last_delivery_status INTEGER)');
+    db.prepare('INSERT INTO authorized_emails (id, email, active) VALUES (1, ?, 1)').run(HOLDER);
+    db.prepare('INSERT INTO tokens (id, email, token, authorized_email, url, date) VALUES (1, ?, ?, 1, NULL, ?)').run(HOLDER, held, ago(DAY_MS));
+    db.prepare(`INSERT INTO externalities (id, org, atlas, item, what, who_acts, how_observed, state, set_date, cleared_date, cleared_words, token_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`).run('add-1', ORG, 'none', 'add-item', 'made by add', 'someone', 'somehow', 'open', ago(DAY_MS), null, null);
+    db.prepare('INSERT INTO notices (id, item, state, what, body, received, token_id) VALUES (?, ?, ?, ?, ?, ?, 1)')
+      .run('kept-n1', 'feature/ow-kept', 'open', 'w', '{"item":"feature/ow-kept","state":"open","what":"w"}', ago(DAY_MS));
+    db.prepare('INSERT INTO thirdparty (id, last_delivery_date, last_delivery_status) VALUES (1, ?, ?)').run(ago(DAY_MS), 204);
+  } finally {
+    db.close();
+  }
+  return held;
+}
+
+// Every row of the named tables, and the names of every table, read from a database file.
+function snapshot(file, tables) {
+  const db = new DatabaseSync(file);
+  try {
+    return {
+      names: db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((r) => r.name),
+      rows: Object.fromEntries(tables.map((t) => [t, db.prepare(`SELECT * FROM ${t} ORDER BY id`).all().map((r) => ({ ...r }))])),
+    };
+  } finally {
+    db.close();
+  }
+}
+
+const KEPT_TABLES = ['notices', 'tokens', 'authorized_emails', 'thirdparty'];
+
+// A local server that answers every post with a redirect to `to`, counting the posts it gets.
+async function redirector(to) {
+  const r = { hits: 0 };
+  r.server = http.createServer((req, res) => {
+    r.hits += 1;
+    req.resume();
+    req.on('end', () => res.writeHead(302, { location: to }).end());
+  });
+  await new Promise((resolve) => r.server.listen(0, '127.0.0.1', resolve));
+  r.url = `http://127.0.0.1:${r.server.address().port}/hook`;
+  r.close = async () => { r.server.closeAllConnections(); await new Promise((resolve) => r.server.close(resolve)); };
+  return r;
+}
+
+test('one-way A1: each of the four retired calls answers 404 not found with a valid token, with none and with a wrong one', async () => {
+  const variants = (token) => [
+    ['a valid token', { ...bearer(token), 'X-Org-Slug': ORG, 'X-Atlas-Slug': 'ow-a1', 'X-Item-Slug': 'ow-a1-item' }],
+    ['none', {}],
+    ['a wrong one', bearer('made-up')],
+  ];
+  for (const [method, path, opts] of RETIRED) {
+    for (const [label, headers] of variants(TOKEN)) {
+      assert.deepEqual(await call(method, path, { ...opts, headers }), NOT_FOUND, `${method} ${path}: ${label}`);
+    }
+  }
+  const s = await oneWay();
+  try {
+    const t = await s.token();
+    for (const [method, path, opts] of RETIRED) {
+      for (const [label, headers] of variants(t)) {
+        assert.deepEqual(await s.req(method, path, { ...opts, headers }), NOT_FOUND, `with the notice address on, ${method} ${path}: ${label}`);
+      }
+    }
+    assert.deepEqual(await s.notify(t, notice('feature/ow-a1', 'open')), KEPT, 'the notice is the way in');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A2: a database holding an externalities table with a row opens with that table gone and the drop line logged once', async () => {
+  const dir = mkdtempSync(join(dataDir, 'one-way-a2-'));
+  addStoreDatabase(dir);
+  assert.ok(snapshot(join(dir, 'externalities.sqlite'), []).names.includes('externalities'), 'the table is there before the start');
+  const s = await oneWay({ dir, list: false });
+  try {
+    assert.deepEqual(s.lines, [DROPPED_ONE], 'one line, once');
+    assert.equal(snapshot(s.file, []).names.includes('externalities'), false, 'the table is gone');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A3: after that start the rows of notices, tokens, authorized_emails and thirdparty made before it are all still read', async () => {
+  const dir = mkdtempSync(join(dataDir, 'one-way-a3-'));
+  const held = addStoreDatabase(dir);
+  const before = snapshot(join(dir, 'externalities.sqlite'), KEPT_TABLES).rows;
+  const s = await oneWay({ dir, list: false });
+  try {
+    assert.deepEqual(snapshot(s.file, KEPT_TABLES).rows, before, 'every row of the four tables as it was');
+    const info = await s.tokenInfo(held);
+    assert.equal(info.status, 200, 'the token made before opens its routes');
+    assert.deepEqual(await s.statusOf(held, 'feature/ow-kept'), { status: 200, json: [{ item: 'feature/ow-kept', state: 'open', what: 'w' }] },
+      'the notice made before is read');
+    assert.deepEqual((await s.outcome(held)).json, { 'last-delivery-date': before.thirdparty[0].last_delivery_date, 'last-delivery-status': 204 },
+      'the third-party outcome made before is read');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A4: a second start on the same database logs no drop line and changes nothing', async () => {
+  const dir = mkdtempSync(join(dataDir, 'one-way-a4-'));
+  addStoreDatabase(dir);
+  let s = await oneWay({ dir, list: false });
+  await s.close();
+  const after = snapshot(s.file, KEPT_TABLES);
+  s = await oneWay({ dir, list: false });
+  try {
+    assert.deepEqual(s.lines, [], 'no drop line');
+    assert.deepEqual(snapshot(s.file, KEPT_TABLES), after, 'every table and row as the first start left them');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A5: a call carrying neither slug is accepted by every remaining token route; a notice\'s item and atlas come back whole', async () => {
+  const s = await oneWay();
+  try {
+    const t = await s.token();
+    const item = 'feature/ow-a5 with spaces';
+    const sent = notice(item, 'open', { atlas: 'an-atlas/its slug', what: 'a wait' });
+    assert.deepEqual(await s.notify(t, sent), KEPT, 'the notice, no slug');
+    assert.deepEqual(await s.statusOf(t, item), { status: 200, json: [sent] }, 'the status read, no slug');
+    assert.equal((await s.tokenInfo(t)).status, 200, 'GET /token, no slug');
+    assert.equal((await s.outcome(t)).status, 200, 'GET /thirdparty, no slug');
+    // Slugs sent as headers or parameters are read by nothing: the notice is kept and read back as sent.
+    const slugged = notice(item, 'cleared', { atlas: 'an-atlas/its slug' });
+    const slugs = { 'X-Atlas-Slug': 'other-atlas', 'X-Item-Slug': 'other-item' };
+    assert.deepEqual(await s.notify(t, slugged, slugs), KEPT);
+    assert.deepEqual(await s.statusOf(t, item, { headers: slugs, params: { 'atlas-slug': 'x', 'item-slug': 'y' } }),
+      { status: 200, json: [slugged, sent] }, 'item and atlas whole, the slugs ignored');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A6: a kept notice answers 201 with exactly {"kept": true}', async () => {
+  const s = await oneWay();
+  try {
+    const t = await s.token();
+    const r = await s.notify(t, notice('feature/ow-a6', 'open'));
+    assert.deepEqual(r, KEPT);
+    assert.deepEqual(Object.keys(r.json), ['kept'], 'no id');
+    assert.deepEqual(await s.notify(t, { item: 'feature/ow-a6', state: 'cleared', what: 'w' }), KEPT, 'a cleared notice too');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A7: two notices for one reference and one what, open then cleared, are both returned by the status read, the later first', async () => {
+  const s = await oneWay();
+  try {
+    const t = await s.token();
+    const item = 'feature/ow-a7';
+    const opened = notice(item, 'open', { what: 'one wait' });
+    const cleared = notice(item, 'cleared', { what: 'one wait', 'cleared-date': '2026-11-19T10:00:00.000Z', 'cleared-words': 'it came' });
+    assert.equal((await s.notify(t, opened)).status, 201);
+    await sleep(5);
+    assert.equal((await s.notify(t, cleared)).status, 201);
+    assert.deepEqual(await s.statusOf(t, item), { status: 200, json: [cleared, opened] }, 'both kept, nothing merged or closed');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A8: each refusal of the notice test answers as the shipped cases assert, and nothing is kept', async () => {
+  const s = await oneWay();
+  try {
+    const t = await s.token();
+    const item = 'feature/ow-a8';
+    for (const [label, raw, message] of [
+      ['a blank body', '', RECORD],
+      ['a list', JSON.stringify([{ item, state: 'open', what: 'w' }]), `${RECORD}; got a list`],
+      ['no item', JSON.stringify({ state: 'open', what: 'w' }), ITEM_MSG],
+      ['a state of Open', JSON.stringify({ item, state: 'Open', what: 'w' }), 'state must be open or cleared; got Open'],
+      ['no what', JSON.stringify({ item, state: 'open' }), WHAT_MSG],
+      ['an empty record', '{}', `${ITEM_MSG}; state must be open or cleared; got nothing; ${WHAT_MSG}`],
+    ]) {
+      assert.deepEqual(await s.notify(t, raw), { status: 400, json: { error: message } }, label);
+    }
+    assert.deepEqual(await s.statusOf(t, item), { status: 200, json: [] }, 'nothing kept');
+    assert.equal(noticeIds(s.file).length, 0, 'no row');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A9: a token with a forwarding address receives its own notice once, the body byte-equal to what was sent', async () => {
+  const rx = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    const raw = `{ "item":"feature/ow-a9",  "state":"open","what":"a wait", "n": 1.50, "x":"é" }`;
+    assert.deepEqual(await s.notify(t, raw), KEPT);
+    await waitFor(() => rx.requests.length > 0);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rx.requests.length, 1, 'once');
+    assert.equal(rx.requests[0].body, raw, 'the text exactly as received');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A10: the forwarded post carries content-type application/json and no authorization header', async () => {
+  const rx = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    const raw = JSON.stringify(notice('feature/ow-a10', 'open'));
+    // the notice's own post carries the holder's token as its authorization header
+    assert.equal((await s.notify(t, raw)).status, 201);
+    await waitFor(() => rx.requests.length > 0);
+    assert.equal(rx.requests.length, 1, 'forwarded');
+    const q = rx.requests[0];
+    assert.equal(q.headers['content-type'], 'application/json');
+    assert.equal(q.headers['content-length'], String(Buffer.byteLength(raw)));
+    assert.equal('authorization' in q.headers, false, 'no authorization header');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A11: a notice of state open and one of state cleared are both forwarded', async () => {
+  const rx = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    const texts = [JSON.stringify(notice('feature/ow-a11', 'open')),
+      JSON.stringify(notice('feature/ow-a11', 'cleared', { 'cleared-date': '2026-11-19T10:00:00.000Z', 'cleared-words': 'done' }))];
+    for (const [i, raw] of texts.entries()) {
+      assert.equal((await s.notify(t, raw)).status, 201);
+      await waitFor(() => rx.requests.length > i);
+    }
+    await sleep(NEGATIVE_WAIT);
+    assert.deepEqual(rx.requests.map((q) => q.body), texts, 'open and cleared, each once, in order');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A12: a second token\'s forwarding address receives nothing of the first token\'s notice', async () => {
+  const rxA = await receiver();
+  const rxB = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const a = await s.token(rxA.url);
+    const b = await s.token(rxB.url);
+    assert.equal((await s.notify(a, notice('feature/ow-a12', 'open'))).status, 201);
+    await waitFor(() => rxA.requests.length > 0);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rxA.requests.length, 1, "positive control: the sender's own address got it");
+    assert.equal(rxB.requests.length, 0, "the other token's address got nothing");
+    assert.deepEqual((await s.tokenInfo(b)).json['last-delivery-date'], null, 'no attempt on the other token');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A13: a token with no forwarding address causes no post, and its GET /token shows no delivery', async () => {
+  const rx = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const none = await s.token();
+    await s.token(rx.url); // a token with an address, which sends nothing here
+    assert.equal((await s.notify(none, notice('feature/ow-a13', 'open'))).status, 201);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rx.requests.length, 0, 'no post');
+    const info = (await s.tokenInfo(none)).json;
+    assert.equal(info.url, null);
+    assert.equal(info['last-delivery-date'], null, 'no delivery');
+    assert.equal(info['last-delivery-status'], null, 'no delivery');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A14: a receiver that answers with a redirect is posted to once and the redirect\'s target not at all', async () => {
+  const target = await receiver();
+  const redirecting = await redirector(target.url);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(redirecting.url);
+    assert.equal((await s.notify(t, notice('feature/ow-a14', 'open'))).status, 201);
+    const info = await forwarded(s, t);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(redirecting.hits, 1, 'posted to once');
+    assert.equal(target.requests.length, 0, 'the target receives nothing');
+    assert.equal(info['last-delivery-status'], 302, 'the 3xx is the outcome');
+  } finally {
+    await s.close();
+    await redirecting.close();
+  }
+});
+
+test('one-way A15: a receiver that never answers leaves status 0 after the delivery timeout, the notice having answered 201 first', async () => {
+  const rx = await receiver(null);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    const started = performance.now();
+    const r = await s.notify(t, notice('feature/ow-a15', 'open'));
+    const elapsed = performance.now() - started;
+    assert.equal(r.status, 201);
+    assert.ok(elapsed < DELIVERY_TIMEOUT, `answered in ${Math.round(elapsed)} ms, before the timeout`);
+    const info = await forwarded(s, t);
+    assert.equal(info['last-delivery-status'], 0, 'no response: status 0');
+    assert.match(String(info['last-delivery-date']), ISO);
+    assert.equal(rx.requests.length, 1, 'one request');
+    assert.equal(rx.sockets.size, 1, 'connected once');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A16: a closed port leaves status 0, the notice having answered 201 and being read back by the status read', async () => {
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(await closedPortUrl());
+    const sent = notice('feature/ow-a16', 'open');
+    assert.deepEqual(await s.notify(t, sent), KEPT);
+    assert.deepEqual(await s.statusOf(t, 'feature/ow-a16'), { status: 200, json: [sent] });
+    const info = await forwarded(s, t);
+    assert.equal(info['last-delivery-status'], 0);
+    assert.match(String(info['last-delivery-date']), ISO);
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A17: a forwarding address in a refused range receives nothing; GET /token shows status 0 and the attempt\'s time', async () => {
+  const rx = await receiver();
+  const port = rx.url.split(':')[2].split('/')[0];
+  const s = await oneWay(); // no THIRDPARTY_ALLOW: loopback is refused
+  try {
+    for (const host of ['127.0.0.1', 'localhost', '[::ffff:127.0.0.1]']) {
+      const t = await s.token(`http://${host}:${port}/hook`);
+      const before = new Date().toISOString();
+      assert.equal((await s.notify(t, notice('feature/ow-a17', 'open'))).status, 201, host);
+      const info = await forwarded(s, t);
+      assert.equal(info['last-delivery-status'], 0, `${host}: status 0`);
+      assert.match(String(info['last-delivery-date']), ISO, `${host}: the attempt's time`);
+      assert.ok(info['last-delivery-date'] >= before, `${host}: the time of this attempt`);
+    }
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rx.requests.length, 0, 'nothing sent');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A18: the same address, exempted by THIRDPARTY_ALLOW, receives the notice', async () => {
+  const rx = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    assert.equal((await s.notify(t, notice('feature/ow-a18', 'open'))).status, 201);
+    const info = await forwarded(s, t);
+    assert.equal(rx.requests.length, 1, 'received');
+    assert.equal(info['last-delivery-status'], 200);
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A19: GET /token shows the status and time of the latest attempt, and never the token', async () => {
+  const rx = await receiver(200);
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    assert.equal((await s.notify(t, notice('feature/ow-a19', 'open'))).status, 201);
+    const one = await forwarded(s, t);
+    assert.equal(one['last-delivery-status'], 200);
+    assert.match(String(one['last-delivery-date']), ISO);
+    rx.status = 503;
+    assert.equal((await s.notify(t, notice('feature/ow-a19', 'cleared'))).status, 201);
+    const two = await forwarded(s, t, (x) => x['last-delivery-status'] === 503);
+    assert.equal(two['last-delivery-status'], 503, 'the latest attempt');
+    assert.ok(two['last-delivery-date'] >= one['last-delivery-date'], 'dated no earlier');
+    const r = await s.tokenInfo(t);
+    assert.deepEqual(Object.keys(r.json).sort(), TOKEN_FIELDS);
+    assert.equal(JSON.stringify(r.json).includes(t), false, 'the token is never in the answer');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A20: the forwarded post carries x-externality-passed-on: 1', async () => {
+  const rx = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rx.url);
+    assert.equal((await s.notify(t, notice('feature/ow-a20', 'open'))).status, 201);
+    await waitFor(() => rx.requests.length > 0);
+    assert.equal(rx.requests.length, 1, 'forwarded');
+    assert.equal(rx.requests[0].headers[PASSED], '1');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A21: a notice arriving with that header is kept and answered 201, and reaches neither the forwarding address nor a quiet address', async () => {
+  const rxF = await receiver();
+  const rxQ = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rxF.url);
+    for (const [label, value] of [['one', '1'], ['other', 'no'], ['empty', '']]) {
+      const item = `feature/ow-a21-${label}`;
+      const r = await s.notify(t, tpNotice(item, 'open', rxQ.url), { [PASSED]: value });
+      assert.equal(r.status, 201, label);
+      assert.equal((await s.statusOf(t, item)).json.length, 1, `${label}: kept`);
+    }
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rxF.requests.length, 0, 'not forwarded');
+    assert.equal(rxQ.requests.length, 0, 'not passed on');
+    assert.equal((await s.tokenInfo(t)).json['last-delivery-date'], null, 'no attempt on the token');
+    assert.deepEqual((await s.outcome(t)).json, NULL_OUTCOME, 'no third-party outcome');
+    // the positive control: the same notice without the header reaches both
+    assert.equal((await s.notify(t, tpNotice('feature/ow-a21-control', 'open', rxQ.url))).status, 201);
+    await waitFor(() => rxF.requests.length > 0 && rxQ.requests.length > 0);
+    assert.equal(rxF.requests.length, 1, 'control: forwarded');
+    assert.equal(rxQ.requests.length, 1, 'control: passed on');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A22: a notice naming a quiet address, under a token with a forwarding address, reaches both receivers', async () => {
+  const rxF = await receiver();
+  const rxQ = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const t = await s.token(rxF.url);
+    const raw = tpNotice('feature/ow-a22', 'open', rxQ.url);
+    assert.equal((await s.notify(t, raw)).status, 201);
+    await waitFor(() => rxF.requests.length > 0 && rxQ.requests.length > 0);
+    await sleep(NEGATIVE_WAIT);
+    assert.deepEqual(rxF.requests.map((q) => q.body), [raw], 'the forwarding address, once');
+    assert.deepEqual(rxQ.requests.map((q) => q.body), [raw], 'the quiet address, once');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A23: with either receiver closed, the other still receives the notice, and the notice is kept', async () => {
+  const rxF = await receiver();
+  const rxQ = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    // the quiet address closed: the forwarding address still receives
+    const f = await s.token(rxF.url);
+    assert.equal((await s.notify(f, tpNotice('feature/ow-a23-f', 'open', await closedPortUrl()))).status, 201);
+    await waitFor(() => rxF.requests.length > 0);
+    assert.equal(rxF.requests.length, 1, 'the forwarding address received it, the quiet one closed');
+    assert.equal((await s.statusOf(f, 'feature/ow-a23-f')).json.length, 1, 'kept');
+    // the forwarding address closed: the quiet address still receives
+    const q = await s.token(await closedPortUrl());
+    assert.equal((await s.notify(q, tpNotice('feature/ow-a23-q', 'open', rxQ.url))).status, 201);
+    await waitFor(() => rxQ.requests.length > 0);
+    assert.equal(rxQ.requests.length, 1, 'the quiet address received it, the forwarding one closed');
+    assert.equal((await s.statusOf(q, 'feature/ow-a23-q')).json.length, 1, 'kept');
+    assert.equal((await forwarded(s, q))['last-delivery-status'], 0, 'the closed forwarding address: status 0');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A24: the quiet way and GET /thirdparty behave as before beside the forwarding, each outcome in its own place', async () => {
+  const rxQ = await receiver();
+  const rxF = await receiver();
+  const s = await oneWay({ allow: '127.0.0.1' });
+  try {
+    const plain = await s.token();
+    const raw = tpNotice('feature/ow-a24', 'open', rxQ.url);
+    assert.equal((await s.notify(plain, raw)).status, 201);
+    await waitFor(async () => (await s.outcome(plain)).json['last-delivery-status'] !== null);
+    const quiet = (await s.outcome(plain)).json;
+    assert.equal(quiet['last-delivery-status'], 200, 'the quiet outcome on GET /thirdparty');
+    assert.deepEqual(rxQ.requests.map((q) => q.body), [raw], 'the text as received, once');
+    assert.equal((await s.tokenInfo(plain)).json['last-delivery-date'], null, 'the quiet way writes nothing on the token');
+    // a forwarding alone writes on its token and leaves GET /thirdparty as it was
+    const f = await s.token(rxF.url);
+    assert.equal((await s.notify(f, notice('feature/ow-a24-f', 'open'))).status, 201);
+    await waitFor(() => rxF.requests.length > 0);
+    await sleep(NEGATIVE_WAIT);
+    assert.equal(rxF.requests.length, 1, 'forwarded');
+    assert.deepEqual((await s.outcome(plain)).json, quiet, 'GET /thirdparty unchanged by the forwarding');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A25: a notice of 90 days and a minute is deleted when a notice is kept; one of 90 days less a minute stays, whichever token', async () => {
+  const s = await oneWay();
+  try {
+    const a = await s.token();
+    const b = await s.token();
+    const old = plant(s.file, 'ow-a25-old', 'feature/ow-a25', ago(90 * DAY_MS + 60_000), s.tokenId(a));
+    const young = plant(s.file, 'ow-a25-young', 'feature/ow-a25', ago(90 * DAY_MS - 60_000), s.tokenId(b));
+    assert.deepEqual((await s.statusOf(a, 'feature/ow-a25')).json, [old], 'the old one is there before');
+    assert.deepEqual((await s.statusOf(b, 'feature/ow-a25')).json, [young]);
+    assert.equal((await s.notify(a, notice('feature/ow-a25-new', 'open'))).status, 201);
+    assert.deepEqual((await s.statusOf(a, 'feature/ow-a25')).json, [], 'more than 90 days: gone');
+    assert.deepEqual((await s.statusOf(b, 'feature/ow-a25')).json, [young], 'less than 90 days, under another token: read');
+    assert.deepEqual(noticeIds(s.file).filter((id) => id.startsWith('ow-a25')), ['ow-a25-young']);
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A26: the clean-up reads no variable and holds the 90 days fixed; with likely variables set it still deletes at 90 days', async () => {
+  const code = readFileSync(join(ROOT, 'src', 'notices.js'), 'utf8');
+  assert.doesNotMatch(code, /process\.env|\benv\b/, 'src/notices.js reads no variable');
+  assert.match(code, /\b90 \* 24\b/, 'the 90 days as 90 times 24 hours, a fixed number');
+  const likely = { NOTICE_DAYS: '1', NOTICE_TTL_DAYS: '1', NOTICE_MAX_AGE_DAYS: '1', RETENTION_DAYS: '1', CLEANUP_DAYS: '1',
+    MAX_AGE_DAYS: '1', TTL_DAYS: '1', NOTICE_RETENTION_DAYS: '1000', CLEANUP: 'off' };
+  const s = await oneWay({ env: likely });
+  try {
+    const t = await s.token();
+    const id = s.tokenId(t);
+    plant(s.file, 'ow-a26-2d', 'feature/ow-a26', ago(2 * DAY_MS), id);
+    plant(s.file, 'ow-a26-89d', 'feature/ow-a26', ago(89 * DAY_MS), id);
+    plant(s.file, 'ow-a26-91d', 'feature/ow-a26', ago(91 * DAY_MS), id);
+    assert.equal((await s.notify(t, notice('feature/ow-a26-new', 'open'))).status, 201);
+    assert.deepEqual(noticeIds(s.file).filter((x) => x.startsWith('ow-a26')), ['ow-a26-2d', 'ow-a26-89d'], 'deleted at 90 days, not at 1 or 1000');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A27: with the delete made to fail, the arriving notice is kept and answered 201, and the old notice is still there', async () => {
+  const s = await oneWay();
+  try {
+    const t = await s.token();
+    plant(s.file, 'ow-a27-old', 'feature/ow-a27', ago(100 * DAY_MS), s.tokenId(t));
+    // The delete is made to fail by a trigger written into the database; the service is given no setting for it.
+    const db = new DatabaseSync(s.file);
+    try {
+      db.exec("CREATE TRIGGER ow_a27_no_delete BEFORE DELETE ON notices BEGIN SELECT RAISE(ABORT, 'the delete is made to fail'); END");
+    } finally {
+      db.close();
+    }
+    const sent = notice('feature/ow-a27-new', 'open');
+    assert.deepEqual(await s.notify(t, sent), KEPT, 'answered 201');
+    assert.deepEqual((await s.statusOf(t, 'feature/ow-a27-new')).json, [sent], 'kept');
+    assert.ok(noticeIds(s.file).includes('ow-a27-old'), 'the old notice is still there: the delete did fail');
+    // the positive control: with the trigger gone, the next notice kept deletes it
+    const fix = new DatabaseSync(s.file);
+    try {
+      fix.exec('DROP TRIGGER ow_a27_no_delete');
+    } finally {
+      fix.close();
+    }
+    assert.equal((await s.notify(t, notice('feature/ow-a27-next', 'open'))).status, 201);
+    assert.equal(noticeIds(s.file).includes('ow-a27-old'), false, 'control: deleted once the delete can run');
+  } finally {
+    await s.close();
+  }
+});
+
+test('one-way A28: each remaining route, called with an old notice in place, deletes nothing', async () => {
+  const s = await oneWay();
+  try {
+    const t = await s.token();
+    const old = plant(s.file, 'ow-a28-old', 'feature/ow-a28', ago(100 * DAY_MS), s.tokenId(t));
+    const stays = (label) => assert.ok(noticeIds(s.file).includes('ow-a28-old'), `${label}: the old notice stays`);
+    assert.deepEqual((await s.statusOf(t, 'feature/ow-a28')).json, [old]);
+    stays('the status read');
+    const first = await tokenAt(s.base, 'holder+ow-a28@example.org');
+    stays('a first ask');
+    assert.equal((await askAt(s.base, 'holder+ow-a28@example.org', {}, bearer(first.token))).status, 200);
+    stays('a later ask');
+    await listEmail(s.base, 'ow-a28@example.org');
+    stays('POST /emails');
+    await activate(s.base, 'ow-a28@example.org', false);
+    stays('POST /emails/active');
+    assert.equal((await s.tokenInfo(t)).status, 200);
+    stays('GET /token');
+    assert.equal((await s.outcome(t)).status, 200);
+    stays('GET /thirdparty');
+    assert.equal((await s.req('GET', '/')).status, 200);
+    stays('GET /');
+    assert.equal((await s.notify(t, '{}')).status, 400);
+    stays('a refused notice');
+    // the positive control: a kept notice deletes it
+    assert.equal((await s.notify(t, notice('feature/ow-a28-new', 'open'))).status, 201);
+    assert.equal(noticeIds(s.file).includes('ow-a28-old'), false, 'control: the keeping of a notice deletes it');
+  } finally {
+    await s.close();
+  }
+});
+
+// The shipped cases that use no retired call, each as the SHA-256 (first 16 hex digits) of its text at 792a883: a case
+// is each `test(` with a literal name, to the first `})` line at its own indent.
+const UNCHANGED_AT_792A883 = [
+  'b300989daba04199', 'b5738f205d9ab3a1', '0f43b4135eff94de', '78cf598e9eecfac5', 'abb29dbd7643aff8',
+  'e9a7b46a11023201', '8bbd9a123d15403a', '35c367723c01ce8f', 'f7e304fdfa08bb39', '39207af54b4b9500',
+  'a16bc8033f2e5b00', '41213260e2271665', '94dc63dde49b0d9c', '9785a2f3f7a55c33', '11bc171138af2ff3',
+  '5629cf2a91fd4dde', '45136a18b1383f17', '77b56bf87d44e011', 'f937cc2aa8caeeeb', '8037cbc973aa5191',
+  '908e6d2f7db75a30', 'c1eae32386140274', '672fbde65a117b27', '279e985b06371f46', 'ed7d3342bef027d8',
+  '4909c9edca4cbb28', '97a8602bddddb85c', 'd5114455731ab0ca', '3e57e0258d2ea3f8', '2055188dc2962ea6',
+  'f89c996dbc1dbd58', '21302f13ac94df60', '408cb0096781d4f9', '301e5bab9a5d5396', 'fb9121eadcb8d2d2',
+  'ca0e73b0a8aa88e7', 'af435540528016a2', '55b94268cf626aff', 'a86fb28d702233f4', 'b10ce2d67d364dda',
+  '790d8776bb1f6c0e', 'd7fe457063d1fa86', '448f008452df69a2', 'd478c38909e72a31', '0c3ab4666e7da24f',
+  'cf7f7a92b2a4930c', 'e7fd0a0323bb1868', '73b33929ae8a1dc4', '9e7d1a38f2c7d05f', '29a43beaeca66668',
+  'c9a0f8e5e9ce8803', '942be3bbee2e7b3a', '205a852360edded1', '8867d343bd501c63', '48a7fce6e958b5d8',
+  'e3402deeb45593ef', '410726760abb39c4', '14874e6f76349bf6', '0fc7ee730be156f5', 'c966ecfa79441c95',
+  'cb53b3de5d37e76f', 'f175901036f94a3d', '0cfff9542bd0dfa3', '9796fd99898a589a', '506368273ad05ccd',
+  'ee021bc47293093f', '218f9a7d5c990df5', 'ebe27ccc732ef6b6',
+];
+
+test('one-way A29: every shipped case that uses no retired call is byte-equal to its text at 792a883', () => {
+  const lines = readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n');
+  const have = new Set();
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(\s*)test\(\s*(['"`])((?:\\.|(?!\2)[^\\])*)\2/.exec(lines[i]);
+    if (!m) continue;
+    const end = new RegExp(`^${m[1]}\\}\\)[;,]?\\s*$`);
+    let j = i + 1;
+    while (j < lines.length && !end.test(lines[j])) j++;
+    have.add(createHash('sha256').update(lines.slice(i, j + 1).join('\n')).digest('hex').slice(0, 16));
+  }
+  assert.equal(UNCHANGED_AT_792A883.length, 68);
+  assert.deepEqual(UNCHANGED_AT_792A883.filter((h) => !have.has(h)), [], 'each such case is present, byte for byte');
+});
+
+test('one-way A30: GET / answers the service\'s name externality-tracker', async () => {
+  assert.equal((await call('GET', '/')).json.service, 'externality-tracker');
+  const s = await oneWay({ list: false });
+  try {
+    const r = await s.req('GET', '/');
+    assert.equal(r.status, 200);
+    assert.equal(r.json.service, 'externality-tracker');
   } finally {
     await s.close();
   }
