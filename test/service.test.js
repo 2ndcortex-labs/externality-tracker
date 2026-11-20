@@ -692,7 +692,7 @@ test('A21: at an open address a wrong part answers 404; the right part with no t
     assert.deepEqual(await at('GET', statusPath(item), { headers }), { status: 401, json: { error: reason } }, `status: ${label}`);
   }
   const kept = await post(notice(item, 'open'));
-  assert.deepEqual(Object.keys(kept), ['id']);
+  assert.deepEqual(kept, { kept: true });
   assert.deepEqual(await statusOf(item), [notice(item, 'open')], 'kept once, the refused posts not at all');
 });
 
@@ -1289,7 +1289,7 @@ test('thirdparty: the notice is answered and kept with a slow, a failing and a r
       const r = await s.notify(tpNotice(item, 'open', url));
       const elapsed = performance.now() - started;
       assert.equal(r.status, 201, label);
-      assert.deepEqual(Object.keys(r.json), ['id'], label);
+      assert.deepEqual(r.json, { kept: true }, label);
       assert.ok(elapsed < DELIVERY_TIMEOUT, `${label}: answered in ${Math.round(elapsed)} ms, before the timeout`);
       assert.equal((await s.statusOf(item)).json.length, 1, `${label}: kept`);
     }
@@ -1523,7 +1523,7 @@ test('thirdparty: a notice carrying x-externality-passed-on, any value, is kept 
       const item = `feature/tp-passed-${label}`;
       const r = await s.notify(tpNotice(item, 'open', rx.url), { [PASSED]: value });
       assert.equal(r.status, 201, label);
-      assert.deepEqual(Object.keys(r.json), ['id'], label);
+      assert.deepEqual(r.json, { kept: true }, label);
       assert.equal((await s.statusOf(item)).json.length, 1, `${label}: kept`);
     }
     await sleep(NEGATIVE_WAIT);
@@ -2860,22 +2860,22 @@ test('one-way A28: each remaining route, called with an old notice in place, del
 });
 
 // The shipped cases that use no retired call, each as the SHA-256 (first 16 hex digits) of its text at 792a883: a case
-// is each `test(` with a literal name, to the first `})` line at its own indent. Six cases the class rule first counted
-// here are left out by the lead's ruling, as they used the add call through a helper or asserted what the spec changes:
+// is each `test(` with a literal name, to the first `})` line at its own indent. Nine cases the class rule first counted
+// here are left out by the lead's rulings, as they used the add call through a helper or asserted what the spec changes:
 // A23, "delivery: a token without a URL…", "delivery: a receiver answering 500…", "delivery: a second add…",
-// "notify: a kept notice answers 201…" and A25.
+// "notify: a kept notice answers 201…", A25, A21, "thirdparty: the notice is answered and kept…" and
+// "thirdparty: a notice carrying x-externality-passed-on…".
 const UNCHANGED_AT_792A883 = [
   'b300989daba04199', 'b5738f205d9ab3a1', '0f43b4135eff94de', '78cf598e9eecfac5', 'abb29dbd7643aff8',
   'e9a7b46a11023201', '8bbd9a123d15403a', '35c367723c01ce8f', 'f7e304fdfa08bb39', '39207af54b4b9500',
   'a16bc8033f2e5b00', '41213260e2271665', '94dc63dde49b0d9c', '9785a2f3f7a55c33', '11bc171138af2ff3',
   '5629cf2a91fd4dde', '45136a18b1383f17', '77b56bf87d44e011', 'f937cc2aa8caeeeb', '8037cbc973aa5191',
-  '908e6d2f7db75a30',
   '4909c9edca4cbb28', '97a8602bddddb85c', 'd5114455731ab0ca', '3e57e0258d2ea3f8', '2055188dc2962ea6',
   'f89c996dbc1dbd58', '408cb0096781d4f9', '301e5bab9a5d5396', 'fb9121eadcb8d2d2',
   'ca0e73b0a8aa88e7', 'af435540528016a2', '55b94268cf626aff', 'a86fb28d702233f4', 'b10ce2d67d364dda',
-  '790d8776bb1f6c0e', 'd7fe457063d1fa86', '448f008452df69a2', 'd478c38909e72a31', '0c3ab4666e7da24f',
+  'd7fe457063d1fa86', '448f008452df69a2', 'd478c38909e72a31', '0c3ab4666e7da24f',
   'cf7f7a92b2a4930c', 'e7fd0a0323bb1868', '73b33929ae8a1dc4', '9e7d1a38f2c7d05f', '29a43beaeca66668',
-  'c9a0f8e5e9ce8803', '942be3bbee2e7b3a', '205a852360edded1', '8867d343bd501c63', '48a7fce6e958b5d8',
+  'c9a0f8e5e9ce8803', '942be3bbee2e7b3a','8867d343bd501c63', '48a7fce6e958b5d8',
   'e3402deeb45593ef', '410726760abb39c4', '0fc7ee730be156f5', 'c966ecfa79441c95',
   'cb53b3de5d37e76f', 'f175901036f94a3d', '0cfff9542bd0dfa3', '9796fd99898a589a', '506368273ad05ccd',
   'ee021bc47293093f', '218f9a7d5c990df5', 'ebe27ccc732ef6b6',
@@ -2892,7 +2892,7 @@ test('one-way A29: every shipped case that uses no retired call is byte-equal to
     while (j < lines.length && !end.test(lines[j])) j++;
     have.add(createHash('sha256').update(lines.slice(i, j + 1).join('\n')).digest('hex').slice(0, 16));
   }
-  assert.equal(UNCHANGED_AT_792A883.length, 62);
+  assert.equal(UNCHANGED_AT_792A883.length, 59);
   assert.deepEqual(UNCHANGED_AT_792A883.filter((h) => !have.has(h)), [], 'each such case is present, byte for byte');
 });
 
